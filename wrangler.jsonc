@@ -1,20 +1,20 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "webapp",
+  "name": "dohajun-chat",
   "compatibility_date": "2026-03-17",
   "pages_build_output_dir": "./dist",
   "compatibility_flags": ["nodejs_compat"],
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "webapp-production",
-      "database_id": "local-dev"
+      "database_name": "dohajun-chat-production",
+      "database_id": "32eb88ec-d290-485b-86fd-23b124e28e5c"
     }
   ],
   "kv_namespaces": [
     {
       "binding": "KV",
-      "id": "local-dev-kv"
+      "id": "58984182f2b444a88ff4eb93ba6108e6"
     }
   ]
 }
