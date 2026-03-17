@@ -7,10 +7,13 @@ type Bindings = {
   KV: KVNamespace
   OPENAI_API_KEY?: string
   OPENAI_BASE_URL?: string
+  CLAUDE_API_KEY?: string
   JWT_SECRET?: string
   ADMIN_PASSWORD?: string
   GUEST_TOKEN_LIMIT?: string
   MEMBER_TOKEN_LIMIT?: string
+  TOSS_CLIENT_KEY?: string
+  TOSS_SECRET_KEY?: string
 }
 
 type Variables = {
@@ -142,24 +145,39 @@ async function verifyPassword(password: string, stored: string): Promise<boolean
   return computedHex === hashHex
 }
 
-// ─── LLM API Call ───
-async function askLLM(messages: any[], env: Bindings): Promise<string> {
-  // Try KV for runtime API key first
-  let apiKey = ''
-  let baseUrl = 'https://api.openai.com/v1'
-  
-  try {
-    const kvKey = await env.KV.get('openai_api_key')
-    const kvUrl = await env.KV.get('openai_base_url')
-    if (kvKey) apiKey = kvKey
-    if (kvUrl) baseUrl = kvUrl
-  } catch {}
-  
-  if (!apiKey && env.OPENAI_API_KEY) apiKey = env.OPENAI_API_KEY
-  if (env.OPENAI_BASE_URL) baseUrl = env.OPENAI_BASE_URL
-  
-  if (!apiKey) throw new Error('API key not configured')
+// ─── LLM API Call (Claude 우선 → OpenAI fallback) ───
+async function askClaude(messages: any[], apiKey: string): Promise<string> {
+  // Convert OpenAI format to Claude format
+  const systemMsg = messages.find((m: any) => m.role === 'system')
+  const chatMsgs = messages.filter((m: any) => m.role !== 'system')
 
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      system: systemMsg?.content || '',
+      messages: chatMsgs.map((m: any) => ({ role: m.role, content: m.content })),
+      temperature: 0.85,
+      top_p: 0.9
+    })
+  })
+
+  if (!resp.ok) {
+    const err = await resp.text()
+    throw new Error(`Claude API error: ${resp.status} - ${err}`)
+  }
+
+  const data: any = await resp.json()
+  return data.content[0].text
+}
+
+async function askOpenAI(messages: any[], apiKey: string, baseUrl: string): Promise<string> {
   const resp = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -177,11 +195,47 @@ async function askLLM(messages: any[], env: Bindings): Promise<string> {
 
   if (!resp.ok) {
     const err = await resp.text()
-    throw new Error(`LLM API error: ${resp.status} - ${err}`)
+    throw new Error(`OpenAI API error: ${resp.status} - ${err}`)
   }
 
   const data: any = await resp.json()
   return data.choices[0].message.content
+}
+
+async function askLLM(messages: any[], env: Bindings): Promise<string> {
+  // 1) Try Claude API first (priority)
+  let claudeKey = ''
+  try {
+    const kvClaudeKey = await env.KV.get('claude_api_key')
+    if (kvClaudeKey) claudeKey = kvClaudeKey
+  } catch {}
+  if (!claudeKey && env.CLAUDE_API_KEY) claudeKey = env.CLAUDE_API_KEY
+
+  if (claudeKey) {
+    try {
+      return await askClaude(messages, claudeKey)
+    } catch (e: any) {
+      console.error('Claude API failed, trying OpenAI fallback:', e.message)
+    }
+  }
+
+  // 2) Fallback to OpenAI-compatible API
+  let openaiKey = ''
+  let baseUrl = 'https://api.openai.com/v1'
+  try {
+    const kvKey = await env.KV.get('openai_api_key')
+    const kvUrl = await env.KV.get('openai_base_url')
+    if (kvKey) openaiKey = kvKey
+    if (kvUrl) baseUrl = kvUrl
+  } catch {}
+  if (!openaiKey && env.OPENAI_API_KEY) openaiKey = env.OPENAI_API_KEY
+  if (env.OPENAI_BASE_URL) baseUrl = env.OPENAI_BASE_URL
+
+  if (openaiKey) {
+    return await askOpenAI(messages, openaiKey, baseUrl)
+  }
+
+  throw new Error('API key not configured. Claude 또는 OpenAI API 키를 설정해주세요.')
 }
 
 // ─── Response Parser ───
@@ -336,12 +390,16 @@ app.post('/api/guest/init', async (c) => {
 
 // GET /api/status - Server status
 app.get('/api/status', async (c) => {
-  let apiStatus = 'none'
+  let claudeStatus = 'none'
+  let openaiStatus = 'none'
   try {
-    const kvKey = await c.env.KV.get('openai_api_key')
-    if (kvKey || c.env.OPENAI_API_KEY) apiStatus = 'configured'
+    const kvClaude = await c.env.KV.get('claude_api_key')
+    if (kvClaude || c.env.CLAUDE_API_KEY) claudeStatus = 'configured'
+    const kvOpenai = await c.env.KV.get('openai_api_key')
+    if (kvOpenai || c.env.OPENAI_API_KEY) openaiStatus = 'configured'
   } catch {}
-  return c.json({ status: 'ok', api: apiStatus })
+  const api = claudeStatus === 'configured' || openaiStatus === 'configured' ? 'configured' : 'none'
+  return c.json({ status: 'ok', api, claude: claudeStatus, openai: openaiStatus })
 })
 
 // ═══  USER API  ═══
@@ -488,7 +546,7 @@ app.post('/api/chat', authMiddleware, async (c) => {
     if (user.is_guest) {
       return c.json({ error: 'GUEST_LIMIT', message: '무료 대화 횟수가 모두 소진되었습니다. 회원가입하면 더 많은 대화를 즐길 수 있어요!' }, 403)
     }
-    return c.json({ error: 'TOKEN_LIMIT', message: '대화 횟수가 모두 소진되었습니다.' }, 403)
+    return c.json({ error: 'TOKEN_LIMIT', message: '대화 횟수가 모두 소진되었습니다. 토큰을 충전하면 계속 대화할 수 있어요!', tokenUsed: user.token_used, tokenLimit: user.token_limit }, 403)
   }
   
   // Load session history
@@ -627,9 +685,10 @@ app.post('/api/admin/character/update', adminAuth, async (c) => {
 
 // POST /api/admin/keys
 app.post('/api/admin/keys', adminAuth, async (c) => {
-  const { openaiApiKey, openaiBaseUrl } = await c.req.json()
-  if (openaiApiKey) await c.env.KV.put('openai_api_key', openaiApiKey)
-  if (openaiBaseUrl) await c.env.KV.put('openai_base_url', openaiBaseUrl)
+  const { claudeApiKey, openaiApiKey, openaiBaseUrl } = await c.req.json()
+  if (claudeApiKey !== undefined) await c.env.KV.put('claude_api_key', claudeApiKey)
+  if (openaiApiKey !== undefined) await c.env.KV.put('openai_api_key', openaiApiKey)
+  if (openaiBaseUrl !== undefined) await c.env.KV.put('openai_base_url', openaiBaseUrl)
   return c.json({ success: true })
 })
 
@@ -682,6 +741,134 @@ app.get('/api/admin/stats', adminAuth, async (c) => {
     guests: (totalGuests as any)?.cnt || 0,
     sessions: (totalSessions as any)?.cnt || 0
   })
+})
+
+// ═══  PAYMENT API (토스 페이먼츠)  ═══
+
+// GET /api/payment/config - Get payment configuration for frontend
+app.get('/api/payment/config', async (c) => {
+  let tossClientKey = ''
+  try {
+    tossClientKey = await c.env.KV.get('toss_client_key') || c.env.TOSS_CLIENT_KEY || ''
+  } catch {}
+  
+  // Get payment plans from KV
+  let plans = []
+  try {
+    const plansJson = await c.env.KV.get('payment_plans')
+    if (plansJson) plans = JSON.parse(plansJson)
+  } catch {}
+  
+  if (plans.length === 0) {
+    plans = [
+      { id: 'plan_30', name: '30회 충전', tokens: 30, price: 3900, popular: false },
+      { id: 'plan_100', name: '100회 충전', tokens: 100, price: 9900, popular: true },
+      { id: 'plan_300', name: '300회 충전', tokens: 300, price: 24900, popular: false }
+    ]
+  }
+  
+  return c.json({ clientKey: tossClientKey, plans, enabled: !!tossClientKey })
+})
+
+// POST /api/payment/prepare - Create payment order
+app.post('/api/payment/prepare', authMiddleware, async (c) => {
+  const userId = c.get('userId')
+  const { planId } = await c.req.json()
+  
+  // Get plans
+  let plans: any[] = []
+  try {
+    const plansJson = await c.env.KV.get('payment_plans')
+    if (plansJson) plans = JSON.parse(plansJson)
+  } catch {}
+  if (plans.length === 0) {
+    plans = [
+      { id: 'plan_30', name: '30회 충전', tokens: 30, price: 3900 },
+      { id: 'plan_100', name: '100회 충전', tokens: 100, price: 9900 },
+      { id: 'plan_300', name: '300회 충전', tokens: 300, price: 24900 }
+    ]
+  }
+  
+  const plan = plans.find((p: any) => p.id === planId)
+  if (!plan) return c.json({ error: '유효하지 않은 상품입니다.' }, 400)
+  
+  const orderId = 'order_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8)
+  
+  // Store order in KV (expires in 30 min)
+  await c.env.KV.put('order_' + orderId, JSON.stringify({
+    userId, planId, tokens: plan.tokens, price: plan.price, status: 'pending', createdAt: Date.now()
+  }), { expirationTtl: 1800 })
+  
+  return c.json({ orderId, amount: plan.price, orderName: plan.name })
+})
+
+// POST /api/payment/confirm - Confirm payment after Toss redirect
+app.post('/api/payment/confirm', authMiddleware, async (c) => {
+  const userId = c.get('userId')
+  const { paymentKey, orderId, amount } = await c.req.json()
+  
+  // Validate order
+  const orderData = await c.env.KV.get('order_' + orderId)
+  if (!orderData) return c.json({ error: '주문 정보를 찾을 수 없습니다.' }, 400)
+  const order = JSON.parse(orderData)
+  if (order.userId !== userId) return c.json({ error: '권한이 없습니다.' }, 403)
+  if (order.price !== amount) return c.json({ error: '결제 금액이 일치하지 않습니다.' }, 400)
+  
+  // Get Toss secret key
+  let secretKey = ''
+  try {
+    secretKey = await c.env.KV.get('toss_secret_key') || c.env.TOSS_SECRET_KEY || ''
+  } catch {}
+  if (!secretKey) return c.json({ error: '결제 시스템이 설정되지 않았습니다.' }, 500)
+  
+  // Confirm with Toss Payments API
+  const tossResp = await fetch('https://api.tosspayments.com/v1/payments/confirm', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Basic ' + btoa(secretKey + ':'),
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ paymentKey, orderId, amount })
+  })
+  
+  if (!tossResp.ok) {
+    const tossErr: any = await tossResp.json()
+    return c.json({ error: tossErr.message || '결제 승인 실패' }, 400)
+  }
+  
+  // Payment confirmed - add tokens to user
+  await c.env.DB.prepare(
+    'UPDATE users SET token_limit = token_limit + ? WHERE id = ?'
+  ).bind(order.tokens, userId).run()
+  
+  // Update order status
+  await c.env.KV.put('order_' + orderId, JSON.stringify({ ...order, status: 'confirmed', paymentKey }))
+  
+  // Get updated user info
+  const user: any = await c.env.DB.prepare('SELECT token_used, token_limit FROM users WHERE id = ?').bind(userId).first()
+  
+  return c.json({ success: true, tokensAdded: order.tokens, tokenUsed: user.token_used, tokenLimit: user.token_limit })
+})
+
+// POST /api/admin/payment - Save payment settings
+app.post('/api/admin/payment', adminAuth, async (c) => {
+  const { tossClientKey, tossSecretKey, plans } = await c.req.json()
+  if (tossClientKey !== undefined) await c.env.KV.put('toss_client_key', tossClientKey)
+  if (tossSecretKey !== undefined) await c.env.KV.put('toss_secret_key', tossSecretKey)
+  if (plans) await c.env.KV.put('payment_plans', JSON.stringify(plans))
+  return c.json({ success: true })
+})
+
+// GET /api/admin/payment - Get payment settings
+app.get('/api/admin/payment', adminAuth, async (c) => {
+  let clientKey = '', secretKey = '', plans = []
+  try {
+    clientKey = await c.env.KV.get('toss_client_key') || ''
+    secretKey = await c.env.KV.get('toss_secret_key') || ''
+    const plansJson = await c.env.KV.get('payment_plans')
+    if (plansJson) plans = JSON.parse(plansJson)
+  } catch {}
+  return c.json({ tossClientKey: clientKey, tossSecretKeySet: !!secretKey, plans })
 })
 
 // ═══  FILE UPLOAD API  ═══
@@ -807,6 +994,14 @@ app.get('/admin', async (c) => {
 
 // Default route - Serve main SPA
 app.get('/', async (c) => {
+  return c.html(mainHTML)
+})
+
+// Payment callback routes (redirect back to main SPA which handles the logic)
+app.get('/payment/success', async (c) => {
+  return c.html(mainHTML)
+})
+app.get('/payment/fail', async (c) => {
   return c.html(mainHTML)
 })
 
@@ -940,6 +1135,14 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
 .genre-chip{padding:12px;text-align:center;font-size:13px;background:var(--surface2);border:2px solid transparent;border-radius:12px;cursor:pointer;transition:all .2s}
 .genre-chip.selected{border-color:var(--accent);background:rgba(124,92,191,.15);color:var(--accent3)}
 .error-msg{color:var(--err);font-size:12px;margin-top:6px;display:none}
+.pay-plan{padding:16px;background:var(--surface2);border:2px solid var(--border);border-radius:14px;cursor:pointer;transition:all .2s;margin-bottom:10px;position:relative}
+.pay-plan.selected{border-color:var(--accent);background:rgba(124,92,191,.1)}
+.pay-plan.popular{border-color:rgba(124,92,191,.4)}
+.pay-plan-badge{position:absolute;top:-8px;right:12px;background:var(--accent);color:#fff;font-size:10px;font-weight:700;padding:2px 10px;border-radius:8px}
+.pay-plan-name{font-size:15px;font-weight:700;color:var(--text);margin-bottom:4px}
+.pay-plan-info{display:flex;justify-content:space-between;align-items:center}
+.pay-plan-tokens{font-size:12px;color:var(--accent3)}
+.pay-plan-price{font-size:16px;font-weight:800;color:var(--text)}
 .menu-btn{font-size:18px;color:var(--muted);background:none;border:none;cursor:pointer;padding:6px}
 .menu-dropdown{display:none;position:absolute;right:16px;top:48px;background:var(--surface2);border:1px solid var(--border);border-radius:12px;overflow:hidden;z-index:200;min-width:160px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
 .menu-dropdown.show{display:block}
@@ -1114,6 +1317,27 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
       <input class="form-input" id="charNameInput" type="text" value="자기" placeholder="자기, 이름, 별명..." maxlength="10">
     </div>
     <button class="form-btn" onclick="doCharNameStep()">완료</button>
+  </div>
+</div>
+
+<!-- Payment Modal -->
+<div class="modal-overlay" id="paymentModal">
+  <div class="modal-sheet" style="max-height:85vh;overflow-y:auto">
+    <div class="modal-handle"></div>
+    <div class="modal-title">💎 토큰 충전</div>
+    <div class="modal-subtitle">대화 횟수를 충전하고 도하준과의 대화를 계속하세요</div>
+    <div id="paymentPlans" style="margin:16px 0"></div>
+    <div id="paymentStatus" style="font-size:12px;color:var(--muted);text-align:center;margin:8px 0"></div>
+    <button class="form-btn" id="paymentBtn" onclick="processPayment()" style="background:linear-gradient(135deg,#3b82f6,#7c5cbf)">
+      <i class="fas fa-credit-card"></i>&nbsp; 결제하기
+    </button>
+    <div style="font-size:11px;color:var(--muted);text-align:center;margin-top:12px;line-height:1.6">
+      토스 페이먼츠로 안전하게 결제됩니다<br>
+      결제 완료 즉시 토큰이 충전됩니다
+    </div>
+    <div style="text-align:center;margin-top:8px">
+      <a href="#" onclick="closeModal('paymentModal')" style="font-size:12px;color:var(--muted)">나중에 하기</a>
+    </div>
   </div>
 </div>
 
@@ -1436,6 +1660,7 @@ async function sendMsg() {
     
     if (data.error === 'TOKEN_LIMIT') {
       appendSysMsg(data.message)
+      showPaymentModal()
       return
     }
     
@@ -1687,6 +1912,151 @@ function hideModals() {
   document.querySelectorAll('.modal-overlay').forEach(el => el.classList.remove('show'))
 }
 
+function closeModal(id) {
+  document.getElementById(id).classList.remove('show')
+}
+
+// ─── Payment Functions ───
+let paymentConfig = null
+let selectedPlan = null
+
+async function loadPaymentConfig() {
+  try {
+    const resp = await fetch('/api/payment/config')
+    paymentConfig = await resp.json()
+  } catch(e) { paymentConfig = { enabled: false, plans: [] } }
+}
+
+function showPaymentModal() {
+  if (!paymentConfig) { loadPaymentConfig().then(showPaymentModal); return }
+  
+  const container = document.getElementById('paymentPlans')
+  const statusEl = document.getElementById('paymentStatus')
+  
+  if (!paymentConfig.enabled) {
+    container.innerHTML = '<div style="text-align:center;padding:20px;color:var(--muted)"><i class="fas fa-exclamation-circle" style="font-size:32px;margin-bottom:10px;display:block"></i>결제 시스템이 아직 준비 중입니다.<br>잠시 후 다시 시도해 주세요.</div>'
+    document.getElementById('paymentBtn').style.display = 'none'
+    showModal('paymentModal')
+    return
+  }
+  
+  document.getElementById('paymentBtn').style.display = ''
+  selectedPlan = null
+  
+  let html = ''
+  paymentConfig.plans.forEach(function(p, i) {
+    html += '<div class="pay-plan' + (p.popular ? ' popular' : '') + '" onclick="selectPlan(' + i + ')" id="payPlan' + i + '">'
+    if (p.popular) html += '<div class="pay-plan-badge">추천</div>'
+    html += '<div class="pay-plan-name">' + p.name + '</div>'
+    html += '<div class="pay-plan-info"><span class="pay-plan-tokens">💬 ' + p.tokens + '회 대화</span><span class="pay-plan-price">₩' + p.price.toLocaleString() + '</span></div>'
+    html += '</div>'
+  })
+  container.innerHTML = html
+  statusEl.textContent = ''
+  
+  // Auto-select popular plan
+  const popIdx = paymentConfig.plans.findIndex(function(p) { return p.popular })
+  if (popIdx >= 0) selectPlan(popIdx)
+  
+  showModal('paymentModal')
+}
+
+function selectPlan(idx) {
+  selectedPlan = paymentConfig.plans[idx]
+  document.querySelectorAll('.pay-plan').forEach(function(el, i) {
+    el.classList.toggle('selected', i === idx)
+  })
+}
+
+async function processPayment() {
+  if (!selectedPlan) { alert('충전할 요금제를 선택해 주세요.'); return }
+  if (!state.token || state.isGuest) { hideModals(); showModal('loginModal'); return }
+  
+  const statusEl = document.getElementById('paymentStatus')
+  statusEl.textContent = '결제 준비 중...'
+  
+  try {
+    // 1) Prepare order
+    const prepResp = await fetch('/api/payment/prepare', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + state.token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ planId: selectedPlan.id })
+    })
+    const prepData = await prepResp.json()
+    if (!prepResp.ok) { statusEl.textContent = '❌ ' + prepData.error; return }
+    
+    // 2) Load Toss Payments SDK dynamically
+    if (!window.TossPayments) {
+      await new Promise(function(resolve, reject) {
+        const script = document.createElement('script')
+        script.src = 'https://js.tosspayments.com/v1/payment'
+        script.onload = resolve
+        script.onerror = reject
+        document.head.appendChild(script)
+      })
+    }
+    
+    // 3) Open Toss Payment widget
+    statusEl.textContent = '토스 결제창 열기...'
+    const toss = TossPayments(paymentConfig.clientKey)
+    
+    toss.requestPayment('카드', {
+      amount: prepData.amount,
+      orderId: prepData.orderId,
+      orderName: prepData.orderName,
+      customerName: state.nickname || 'User',
+      successUrl: location.origin + '/payment/success',
+      failUrl: location.origin + '/payment/fail'
+    }).catch(function(err) {
+      if (err.code === 'USER_CANCEL') {
+        statusEl.textContent = '결제가 취소되었습니다.'
+      } else {
+        statusEl.textContent = '❌ ' + (err.message || '결제 오류')
+      }
+    })
+    
+  } catch(e) {
+    statusEl.textContent = '❌ 결제 처리 중 오류가 발생했습니다.'
+  }
+}
+
+// Payment callback pages
+if (location.pathname === '/payment/success') {
+  const params = new URLSearchParams(location.search)
+  const paymentKey = params.get('paymentKey')
+  const orderId = params.get('orderId')
+  const amount = parseInt(params.get('amount'))
+  
+  if (paymentKey && orderId && amount) {
+    fetch('/api/payment/confirm', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + (localStorage.getItem('token') || ''), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paymentKey, orderId, amount })
+    }).then(r => r.json()).then(data => {
+      if (data.success) {
+        state.tokenLimit = data.tokenLimit
+        state.tokenUsed = data.tokenUsed
+        localStorage.setItem('tokenLimit', data.tokenLimit)
+        localStorage.setItem('tokenUsed', data.tokenUsed)
+        alert('✅ ' + data.tokensAdded + '회 토큰이 충전되었습니다!')
+      } else {
+        alert('❌ 결제 확인 실패: ' + (data.error || ''))
+      }
+      location.href = '/'
+    }).catch(function() { alert('결제 확인 중 오류'); location.href = '/' })
+  } else {
+    location.href = '/'
+  }
+}
+
+if (location.pathname === '/payment/fail') {
+  alert('결제가 취소되었거나 실패했습니다.')
+  location.href = '/'
+}
+
+// Load payment config on startup
+loadPaymentConfig()
+
 function toggleMenu() {
   document.getElementById('menuDropdown').classList.toggle('show')
 }
@@ -1917,6 +2287,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
 
         <div class="nav-section">시스템</div>
         <button class="nav-item" onclick="showPanel('apikeys',this)"><i class="fas fa-key"></i> API 키 관리</button>
+        <button class="nav-item" onclick="showPanel('payment',this)"><i class="fas fa-credit-card"></i> 결제 설정</button>
         <button class="nav-item" onclick="showPanel('danger',this)"><i class="fas fa-exclamation-triangle"></i> 위험 구역</button>
       </div>
       <div class="sidebar-footer">
@@ -2163,22 +2534,62 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
 
       <!-- API Keys -->
       <div class="panel" id="panel-apikeys">
-        <div class="content-header"><h2>🔑 API 키 관리</h2><p>채팅 LLM에 사용할 API 키를 설정합니다</p></div>
+        <div class="content-header"><h2>🔑 API 키 관리</h2><p>채팅 LLM에 사용할 API 키를 설정합니다. Claude가 우선 사용되고, 실패 시 OpenAI로 자동 전환됩니다</p></div>
         <div class="content-body">
           <div class="card">
-            <div class="card-title"><i class="fas fa-robot"></i> Claude / OpenAI 호환 API</div>
+            <div class="card-title"><i class="fas fa-bolt"></i> Claude API (우선 사용)</div>
             <div class="field">
-              <label>API Key</label>
-              <input class="admin-input" id="apiKey" type="password" placeholder="sk-...">
-              <div class="hint">.env에 없어도 여기서 입력 가능. 런타임에 즉시 적용됩니다</div>
+              <label>Claude API Key</label>
+              <input class="admin-input" id="claudeApiKey" type="password" placeholder="sk-ant-...">
+              <div class="hint">Anthropic Claude API 키. 캐릭터 학습에 최적화되어 우선 사용됩니다</div>
+            </div>
+            <div id="claudeStatus" style="font-size:12px;margin-top:4px"></div>
+          </div>
+          <div class="card">
+            <div class="card-title"><i class="fas fa-robot"></i> OpenAI 호환 API (보조/대체)</div>
+            <div class="field">
+              <label>OpenAI API Key</label>
+              <input class="admin-input" id="openaiApiKey" type="password" placeholder="sk-...">
+              <div class="hint">Claude 실패 시 자동으로 이 키를 사용합니다</div>
             </div>
             <div class="field">
               <label>Base URL</label>
               <input class="admin-input" id="apiBaseUrl" value="https://api.openai.com/v1" placeholder="https://api.openai.com/v1">
               <div class="hint">OpenAI 호환 API 사용 시 Base URL을 변경하세요</div>
             </div>
-            <div class="btn-row"><button class="btn btn-primary" onclick="saveKeys()"><i class="fas fa-save"></i> 저장</button></div>
+            <div id="openaiStatus" style="font-size:12px;margin-top:4px"></div>
           </div>
+          <div class="btn-row"><button class="btn btn-primary" onclick="saveKeys()"><i class="fas fa-save"></i> 저장</button></div>
+        </div>
+      </div>
+
+      <!-- Payment Settings -->
+      <div class="panel" id="panel-payment">
+        <div class="content-header"><h2>💳 결제 설정</h2><p>토스 페이먼츠 연동 및 요금제를 설정합니다</p></div>
+        <div class="content-body">
+          <div class="card">
+            <div class="card-title"><i class="fas fa-credit-card"></i> 토스 페이먼츠 키</div>
+            <div class="field">
+              <label>Client Key (클라이언트 키)</label>
+              <input class="admin-input" id="tossClientKey" placeholder="test_ck_... 또는 live_ck_...">
+              <div class="hint">토스 페이먼츠 대시보드 → 개발 정보에서 확인. 프론트엔드 결제창에 사용됩니다</div>
+            </div>
+            <div class="field">
+              <label>Secret Key (시크릿 키)</label>
+              <input class="admin-input" id="tossSecretKey" type="password" placeholder="test_sk_... 또는 live_sk_...">
+              <div class="hint">결제 승인에 사용됩니다. 보안상 저장 후 다시 표시되지 않습니다</div>
+            </div>
+            <div id="paymentKeyStatus" style="font-size:12px;margin-top:4px"></div>
+          </div>
+          <div class="card">
+            <div class="card-title"><i class="fas fa-tags"></i> 요금제 설정</div>
+            <div id="plansEditor"></div>
+            <div class="btn-row" style="margin-top:12px">
+              <button class="btn btn-secondary btn-sm" onclick="addPlanRow()"><i class="fas fa-plus"></i> 요금제 추가</button>
+            </div>
+            <div class="hint" style="margin-top:8px">사용자가 무료 토큰 소진 시 이 요금제가 결제창에 표시됩니다</div>
+          </div>
+          <div class="btn-row"><button class="btn btn-primary" onclick="savePayment()"><i class="fas fa-save"></i> 저장</button></div>
         </div>
       </div>
 
@@ -2231,6 +2642,7 @@ function ah() { return { 'Authorization':'Bearer '+adminToken, 'Content-Type':'a
 async function loadAll() {
   await loadCharacter()
   loadStats()
+  loadPaymentSettings()
 }
 
 async function loadCharacter() {
@@ -2263,10 +2675,18 @@ async function loadStats() {
   } catch(e) {}
   var sr = await fetch('/api/status')
   var sd = await sr.json()
+  var claudeIcon = sd.claude === 'configured' ? '<span style="color:var(--ok)">✅</span>' : '<span style="color:var(--muted)">⬜</span>'
+  var openaiIcon = sd.openai === 'configured' ? '<span style="color:var(--ok)">✅</span>' : '<span style="color:var(--muted)">⬜</span>'
   document.getElementById('sysInfo').innerHTML =
-    '<b>API 상태:</b> ' + (sd.api === 'configured' ? '<span style="color:var(--ok)">✅ 연결됨</span>' : '<span style="color:var(--warn)">⚠️ 미설정</span>') + '<br>' +
+    '<b>Claude:</b> ' + claudeIcon + (sd.claude === 'configured' ? ' 연결됨' : ' 미설정') + '<br>' +
+    '<b>OpenAI:</b> ' + openaiIcon + (sd.openai === 'configured' ? ' 연결됨' : ' 미설정') + '<br>' +
     '<b>캐릭터:</b> ' + (charData.name || '-') + '<br>' +
     '<b>장르:</b> ' + (charData.genre || '-')
+  // Update API key panel statuses
+  var cs = document.getElementById('claudeStatus')
+  var os = document.getElementById('openaiStatus')
+  if (cs) cs.innerHTML = sd.claude === 'configured' ? '<span style="color:var(--ok)">✅ 키 설정됨 (활성)</span>' : '<span style="color:var(--warn)">⚠️ 미설정</span>'
+  if (os) os.innerHTML = sd.openai === 'configured' ? '<span style="color:var(--ok)">✅ 키 설정됨 (대기)</span>' : '<span style="color:var(--warn)">⚠️ 미설정</span>'
 }
 
 function previewProfile() {
@@ -2346,7 +2766,10 @@ async function deleteSI(id) {
 
 // Save functions
 async function saveKeys() {
-  await fetch('/api/admin/keys', { method:'POST', headers:ah(), body:JSON.stringify({openaiApiKey:document.getElementById('apiKey').value,openaiBaseUrl:document.getElementById('apiBaseUrl').value}) })
+  var claudeKey = document.getElementById('claudeApiKey').value
+  var openaiKey = document.getElementById('openaiApiKey').value
+  var baseUrl = document.getElementById('apiBaseUrl').value
+  await fetch('/api/admin/keys', { method:'POST', headers:ah(), body:JSON.stringify({claudeApiKey:claudeKey,openaiApiKey:openaiKey,openaiBaseUrl:baseUrl}) })
   loadStats()
   toast('✅ API 키 저장됨')
 }
@@ -2391,9 +2814,82 @@ function showPanel(id, btn) {
   var panel = document.getElementById('panel-'+id)
   if (panel) panel.classList.add('active')
   if (btn) btn.classList.add('active')
-  var titles = {dashboard:'통계 요약',step1:'기본 정보',step2:'오프닝 설정',step3:'캐릭터 프롬프트',step4:'상황 이미지',step5:'캐릭터 상세',step6:'세계관 & 스펙',step7:'동영상 관리',apikeys:'API 키 관리',danger:'위험 구역'}
+  var titles = {dashboard:'통계 요약',step1:'기본 정보',step2:'오프닝 설정',step3:'캐릭터 프롬프트',step4:'상황 이미지',step5:'캐릭터 상세',step6:'세계관 & 스펙',step7:'동영상 관리',apikeys:'API 키 관리',payment:'결제 설정',danger:'위험 구역'}
   document.getElementById('mobileTitle').textContent = titles[id] || ''
   closeSidebar()
+}
+
+// ═══ PAYMENT SETTINGS ═══
+async function loadPaymentSettings() {
+  try {
+    var r = await fetch('/api/admin/payment', { headers:ah() })
+    var d = await r.json()
+    document.getElementById('tossClientKey').value = d.tossClientKey || ''
+    document.getElementById('tossSecretKey').value = ''
+    document.getElementById('tossSecretKey').placeholder = d.tossSecretKeySet ? '(설정됨 — 변경하려면 새로 입력)' : 'test_sk_... 또는 live_sk_...'
+    var ps = document.getElementById('paymentKeyStatus')
+    if (ps) ps.innerHTML = d.tossClientKey ? '<span style="color:var(--ok)">✅ 토스 페이먼츠 연결됨</span>' : '<span style="color:var(--warn)">⚠️ 미설정 — 결제 기능 비활성</span>'
+    renderPlans(d.plans && d.plans.length > 0 ? d.plans : [
+      { id:'plan_30', name:'30회 충전', tokens:30, price:3900, popular:false },
+      { id:'plan_100', name:'100회 충전', tokens:100, price:9900, popular:true },
+      { id:'plan_300', name:'300회 충전', tokens:300, price:24900, popular:false }
+    ])
+  } catch(e) {}
+}
+
+function renderPlans(plans) {
+  var html = ''
+  for (var i = 0; i < plans.length; i++) {
+    var p = plans[i]
+    html += '<div style="display:flex;gap:6px;margin-bottom:8px;align-items:center;flex-wrap:wrap">'
+    html += '<input class="admin-input plan-name" value="'+esc(p.name)+'" placeholder="상품명" style="width:28%">'
+    html += '<input class="admin-input plan-tokens" type="number" value="'+(p.tokens||0)+'" placeholder="토큰" style="width:18%">'
+    html += '<input class="admin-input plan-price" type="number" value="'+(p.price||0)+'" placeholder="가격(원)" style="width:22%">'
+    html += '<label style="font-size:11px;color:var(--muted);display:flex;align-items:center;gap:4px;width:14%"><input type="checkbox" class="plan-popular"'+(p.popular?' checked':'')+'>추천</label>'
+    html += '<button class="btn btn-danger btn-sm" onclick="this.parentElement.remove()" style="width:10%"><i class="fas fa-times"></i></button>'
+    html += '</div>'
+  }
+  document.getElementById('plansEditor').innerHTML = html
+}
+
+function addPlanRow() {
+  var rows = document.querySelectorAll('#plansEditor > div')
+  if (rows.length >= 5) { toast('최대 5개까지만 가능합니다'); return }
+  var div = document.createElement('div')
+  div.style.cssText = 'display:flex;gap:6px;margin-bottom:8px;align-items:center;flex-wrap:wrap'
+  div.innerHTML = '<input class="admin-input plan-name" placeholder="상품명" style="width:28%"><input class="admin-input plan-tokens" type="number" placeholder="토큰" style="width:18%"><input class="admin-input plan-price" type="number" placeholder="가격(원)" style="width:22%"><label style="font-size:11px;color:var(--muted);display:flex;align-items:center;gap:4px;width:14%"><input type="checkbox" class="plan-popular">추천</label><button class="btn btn-danger btn-sm" onclick="this.parentElement.remove()" style="width:10%"><i class="fas fa-times"></i></button>'
+  document.getElementById('plansEditor').appendChild(div)
+}
+
+function getPlans() {
+  var plans = []
+  var names = document.querySelectorAll('.plan-name')
+  var tokens = document.querySelectorAll('.plan-tokens')
+  var prices = document.querySelectorAll('.plan-price')
+  var populars = document.querySelectorAll('.plan-popular')
+  for (var i = 0; i < names.length; i++) {
+    if (names[i].value.trim()) {
+      plans.push({
+        id: 'plan_' + (tokens[i].value || i),
+        name: names[i].value.trim(),
+        tokens: parseInt(tokens[i].value) || 0,
+        price: parseInt(prices[i].value) || 0,
+        popular: populars[i].checked
+      })
+    }
+  }
+  return plans
+}
+
+async function savePayment() {
+  var clientKey = document.getElementById('tossClientKey').value.trim()
+  var secretKey = document.getElementById('tossSecretKey').value.trim()
+  var plans = getPlans()
+  var body = { tossClientKey: clientKey, plans: plans }
+  if (secretKey) body.tossSecretKey = secretKey
+  await fetch('/api/admin/payment', { method:'POST', headers:ah(), body:JSON.stringify(body) })
+  loadPaymentSettings()
+  toast('✅ 결제 설정 저장됨')
 }
 
 function openSidebar() {
