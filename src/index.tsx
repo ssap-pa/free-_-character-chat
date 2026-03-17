@@ -1252,28 +1252,41 @@ function hideTyping() {
 
 // ─── Message Parser ───
 function parseMsgSets(raw) {
-  const sets = []
-  const lines = raw.split('\\n').length > 1 ? raw.split('\\n') : raw.split('\n')
-  let curNarr = '', curDial = ''
+  var sets = []
+  var parts = raw.split('\\n')
+  if (parts.length <= 1) parts = raw.split(String.fromCharCode(10))
+  var curNarr = '', curDial = ''
+  var quoteChars = ['"', String.fromCharCode(8220), String.fromCharCode(8221)]
   
-  for (const line of lines) {
-    const t = line.trim()
+  function isQuoteStart(ch) { return ch === '"' || ch.charCodeAt(0) === 8220 }
+  function isQuoteEnd(ch) { return ch === '"' || ch.charCodeAt(0) === 8221 }
+  function stripQuotes(s) {
+    var r = s
+    for (var i = 0; i < quoteChars.length; i++) {
+      while (r.indexOf(quoteChars[i]) >= 0) r = r.replace(quoteChars[i], '')
+    }
+    return r
+  }
+  
+  for (var i = 0; i < parts.length; i++) {
+    var t = parts[i].trim()
     if (!t) continue
     
-    if (t.startsWith('*') && t.endsWith('*')) {
+    if (t.charAt(0) === '*' && t.charAt(t.length - 1) === '*' && t.length > 2) {
       if (curDial && curNarr) {
         sets.push({ narrative: curNarr, dialogue: curDial })
         curNarr = ''; curDial = ''
       }
-      curNarr += (curNarr ? ' ' : '') + t.slice(1, -1)
-    } else if ((t.startsWith('"') || t.startsWith('\u201C')) && (t.endsWith('"') || t.endsWith('\u201D'))) {
-      curDial += (curDial ? ' ' : '') + t.replace(/[""\\u201C\\u201D]/g, '').replace(/^"|"$/g, '')
+      curNarr += (curNarr ? ' ' : '') + t.substring(1, t.length - 1)
+    } else if (isQuoteStart(t.charAt(0)) && isQuoteEnd(t.charAt(t.length - 1)) && t.length > 2) {
+      curDial += (curDial ? ' ' : '') + stripQuotes(t)
     } else {
-      const nm = t.match(/\\*([^*]+)\\*/g) || t.match(/\*([^*]+)\*/g)
-      const dm = t.match(/["\\u201C]([^"\\u201D]+)["\\u201D]/g) || t.match(/"([^"]+)"/g)
-      if (nm) nm.forEach(m => curNarr += (curNarr ? ' ' : '') + m.replace(/[*]/g, ''))
-      if (dm) dm.forEach(m => curDial += (curDial ? ' ' : '') + m.replace(/[""\u201C\u201D]/g, ''))
-      if (!nm && !dm) {
+      var narMatch = t.match(/\\*([^*]+)\\*/g)
+      if (!narMatch) narMatch = t.match(/[*]([^*]+)[*]/g)
+      var dialMatch = t.match(/"([^"]+)"/g)
+      if (narMatch) { for (var j = 0; j < narMatch.length; j++) curNarr += (curNarr ? ' ' : '') + narMatch[j].replace(/[*]/g, '') }
+      if (dialMatch) { for (var k = 0; k < dialMatch.length; k++) curDial += (curDial ? ' ' : '') + stripQuotes(dialMatch[k]) }
+      if (!narMatch && !dialMatch) {
         curDial += (curDial ? ' ' : '') + t
       }
     }
