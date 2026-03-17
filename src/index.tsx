@@ -95,7 +95,8 @@ const DEFAULT_CHARACTER = {
   ],
   genre: 'fantasy',
   hashtags: ['#츤데레', '#헌터', '#그림자군단', '#남친봇', '#롤플레이', '#나혼렙'],
-  situationImages: []
+  situationImages: [],
+  videos: []
 }
 
 // ─── JWT Helpers (simple HMAC-based) ───
@@ -307,7 +308,8 @@ app.get('/api/character', async (c) => {
     hashtags: char.hashtags,
     playGuide: char.playGuide,
     openingMessage: char.openingMessage,
-    situationImages: char.situationImages
+    situationImages: char.situationImages,
+    videos: char.videos || []
   })
 })
 
@@ -682,6 +684,119 @@ app.get('/api/admin/stats', adminAuth, async (c) => {
   })
 })
 
+// ═══  FILE UPLOAD API  ═══
+
+// POST /api/admin/upload - Upload file (image or video) to KV
+app.post('/api/admin/upload', adminAuth, async (c) => {
+  const formData = await c.req.formData()
+  const file = formData.get('file') as File | null
+  if (!file) return c.json({ error: 'No file provided' }, 400)
+
+  const maxSize = 25 * 1024 * 1024 // 25MB limit for KV
+  if (file.size > maxSize) return c.json({ error: '파일 크기가 25MB를 초과합니다.' }, 400)
+
+  const buffer = await file.arrayBuffer()
+  const bytes = new Uint8Array(buffer)
+  // Convert to base64
+  let binary = ''
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i])
+  }
+  const base64 = btoa(binary)
+
+  const fileId = 'file_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8)
+  const mimeType = file.type || 'application/octet-stream'
+  const fileName = file.name || 'upload'
+
+  // Store in KV with metadata
+  await c.env.KV.put(fileId, base64, {
+    metadata: { mimeType, fileName, size: file.size, uploadedAt: Date.now() }
+  })
+
+  return c.json({
+    success: true,
+    fileId,
+    url: '/api/files/' + fileId,
+    mimeType,
+    fileName,
+    size: file.size
+  })
+})
+
+// GET /api/files/:id - Serve uploaded file from KV
+app.get('/api/files/:id', async (c) => {
+  const fileId = c.req.param('id')
+  const { value, metadata } = await c.env.KV.getWithMetadata(fileId)
+  if (!value) return c.json({ error: 'File not found' }, 404)
+
+  const meta = metadata as any || {}
+  const mimeType = meta.mimeType || 'application/octet-stream'
+
+  // Decode base64 to binary
+  const binaryStr = atob(value)
+  const bytes = new Uint8Array(binaryStr.length)
+  for (let i = 0; i < binaryStr.length; i++) {
+    bytes[i] = binaryStr.charCodeAt(i)
+  }
+
+  return new Response(bytes, {
+    headers: {
+      'Content-Type': mimeType,
+      'Cache-Control': 'public, max-age=31536000',
+      'Content-Disposition': 'inline'
+    }
+  })
+})
+
+// ═══  VIDEO MANAGEMENT API  ═══
+
+// POST /api/admin/character/video - Add video clip
+app.post('/api/admin/character/video', adminAuth, async (c) => {
+  const { title, videoUrl, thumbnailUrl, description } = await c.req.json()
+  if (!videoUrl) return c.json({ error: '동영상 URL은 필수입니다.' }, 400)
+  const current = await getCharacterConfig(c.env.KV)
+  const video = {
+    id: 'vid_' + Date.now(),
+    title: title || '동영상 클립',
+    videoUrl,
+    thumbnailUrl: thumbnailUrl || '',
+    description: description || '',
+    createdAt: Date.now()
+  }
+  const videos = [...(current.videos || []), video]
+  await c.env.KV.put('character_config', JSON.stringify({ ...current, videos }))
+  return c.json({ success: true, video })
+})
+
+// PUT /api/admin/character/video/:id - Update video clip
+app.put('/api/admin/character/video/:id', adminAuth, async (c) => {
+  const id = c.req.param('id')
+  const updates = await c.req.json()
+  const current = await getCharacterConfig(c.env.KV)
+  const videos = (current.videos || []).map((v: any) =>
+    v.id === id ? { ...v, ...updates, id } : v
+  )
+  await c.env.KV.put('character_config', JSON.stringify({ ...current, videos }))
+  return c.json({ success: true })
+})
+
+// DELETE /api/admin/character/video/:id - Delete video clip
+app.delete('/api/admin/character/video/:id', adminAuth, async (c) => {
+  const id = c.req.param('id')
+  const current = await getCharacterConfig(c.env.KV)
+  // Also try to delete the KV file if it's an uploaded file
+  const video = (current.videos || []).find((v: any) => v.id === id)
+  if (video) {
+    const urlMatch = (video.videoUrl || '').match(/\/api\/files\/(.+)/)
+    if (urlMatch) try { await c.env.KV.delete(urlMatch[1]) } catch {}
+    const thumbMatch = (video.thumbnailUrl || '').match(/\/api\/files\/(.+)/)
+    if (thumbMatch) try { await c.env.KV.delete(thumbMatch[1]) } catch {}
+  }
+  const videos = (current.videos || []).filter((v: any) => v.id !== id)
+  await c.env.KV.put('character_config', JSON.stringify({ ...current, videos }))
+  return c.json({ success: true })
+})
+
 // ═══  STATIC / SPA  ═══
 
 // Serve admin page
@@ -748,6 +863,12 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
 .section-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px;margin-bottom:16px}
 .section-title{font-size:13px;color:var(--accent2);font-weight:600;margin-bottom:12px;text-transform:uppercase;letter-spacing:1px}
 .section-text{font-size:14px;line-height:1.7;color:var(--text);opacity:.85}
+.video-carousel{display:flex;flex-direction:column;gap:14px}
+.video-card{border-radius:12px;overflow:hidden;background:var(--surface2);border:1px solid var(--border)}
+.video-card video{width:100%;display:block;max-height:260px;object-fit:cover;background:#000}
+.video-card-info{padding:10px 14px}
+.video-card-title{font-size:13px;font-weight:600;color:var(--text);margin-bottom:2px}
+.video-card-desc{font-size:11px;color:var(--muted)}
 .spec-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .spec-item{background:var(--surface2);border-radius:12px;padding:12px;text-align:center}
 .spec-label{font-size:11px;color:var(--muted);margin-bottom:4px}
@@ -860,6 +981,12 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
       <div class="section-card" id="charSection">
         <div class="section-title"><i class="fas fa-user"></i> Character</div>
         <div class="section-text" id="charDetail"></div>
+      </div>
+
+      <!-- Video Section -->
+      <div class="section-card" id="videoSection" style="display:none">
+        <div class="section-title"><i class="fas fa-film"></i> Videos</div>
+        <div class="video-carousel" id="videoCarousel"></div>
       </div>
 
       <!-- Specs Section -->
@@ -1084,6 +1211,20 @@ function renderLanding() {
   
   // Character detail
   document.getElementById('charDetail').textContent = c.characterDetail || ''
+  
+  // Videos
+  const videoSection = document.getElementById('videoSection')
+  const videoCarousel = document.getElementById('videoCarousel')
+  if (c.videos && c.videos.length > 0) {
+    videoSection.style.display = ''
+    videoCarousel.innerHTML = c.videos.map(function(v) {
+      const poster = v.thumbnailUrl ? ' poster="' + v.thumbnailUrl + '"' : ''
+      return '<div class="video-card"><video controls playsinline preload="metadata"' + poster + '><source src="' + v.videoUrl + '"></video>' + (v.title || v.description ? '<div class="video-card-info">' + (v.title ? '<div class="video-card-title">' + v.title + '</div>' : '') + (v.description ? '<div class="video-card-desc">' + v.description + '</div>' : '') + '</div>' : '') + '</div>'
+    }).join('')
+  } else {
+    videoSection.style.display = 'none'
+    videoCarousel.innerHTML = ''
+  }
   
   // Specs
   const specGrid = document.getElementById('specGrid')
@@ -1596,6 +1737,33 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
 /* Profile preview */
 .profile-preview{width:80px;height:80px;border-radius:50%;object-fit:cover;border:3px solid var(--accent);margin-bottom:12px}
 
+/* File Upload */
+.upload-zone{border:2px dashed var(--border);border-radius:12px;padding:24px;text-align:center;cursor:pointer;transition:all .2s;background:var(--surface2);margin-bottom:8px}
+.upload-zone:hover,.upload-zone.dragover{border-color:var(--accent);background:rgba(124,92,191,.08)}
+.upload-zone i{font-size:28px;color:var(--muted);margin-bottom:8px}
+.upload-zone p{font-size:13px;color:var(--muted);margin:0}
+.upload-zone .upload-hint{font-size:11px;color:var(--muted);margin-top:4px}
+.upload-or{text-align:center;font-size:12px;color:var(--muted);margin:8px 0;position:relative}
+.upload-or::before,.upload-or::after{content:'';position:absolute;top:50%;width:35%;height:1px;background:var(--border)}
+.upload-or::before{left:0}
+.upload-or::after{right:0}
+.upload-progress{height:4px;background:var(--surface3);border-radius:2px;overflow:hidden;margin-top:8px;display:none}
+.upload-progress-bar{height:100%;background:var(--accent);border-radius:2px;transition:width .3s;width:0}
+.file-preview{display:flex;align-items:center;gap:10px;padding:10px;background:var(--surface2);border-radius:10px;margin-top:8px}
+.file-preview img,.file-preview video{width:48px;height:48px;border-radius:8px;object-fit:cover}
+.file-preview .file-name{flex:1;font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.file-preview .file-remove{color:var(--err);cursor:pointer;font-size:14px}
+
+/* Video Management */
+.vid-list{display:flex;flex-direction:column;gap:10px;margin-bottom:16px}
+.vid-item{display:flex;align-items:center;gap:12px;background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:12px}
+.vid-thumb{width:64px;height:48px;border-radius:8px;object-fit:cover;background:var(--surface3);position:relative;flex-shrink:0}
+.vid-thumb i{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:16px;color:#fff;text-shadow:0 1px 4px rgba(0,0,0,.5)}
+.vid-info{flex:1;min-width:0}
+.vid-title{font-size:13px;font-weight:600;color:var(--text)}
+.vid-desc{font-size:11px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.vid-actions{display:flex;gap:6px}
+
 /* Toast */
 .toast{position:fixed;top:20px;right:20px;padding:12px 20px;background:var(--ok);color:#fff;border-radius:10px;font-size:13px;font-weight:600;z-index:9999;display:none;animation:toastIn .3s ease;box-shadow:0 4px 20px rgba(0,0,0,.3)}
 @keyframes toastIn{from{opacity:0;transform:translateY(-10px) scale(.95)}to{opacity:1;transform:translateY(0) scale(1)}}
@@ -1655,6 +1823,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
         <button class="nav-item" onclick="showPanel('step4',this)"><span class="step-num">4</span> 상황 이미지</button>
         <button class="nav-item" onclick="showPanel('step5',this)"><span class="step-num">5</span> 캐릭터 상세</button>
         <button class="nav-item" onclick="showPanel('step6',this)"><span class="step-num">6</span> 세계관 & 스펙</button>
+        <button class="nav-item" onclick="showPanel('step7',this)"><span class="step-num">7</span> 동영상 관리</button>
 
         <div class="nav-section">시스템</div>
         <button class="nav-item" onclick="showPanel('apikeys',this)"><i class="fas fa-key"></i> API 키 관리</button>
@@ -1706,9 +1875,18 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
               <div class="hint">채팅 헤더 서브타이틀에 표시됩니다</div>
             </div>
             <div class="field">
-              <label>프로필 이미지 URL</label>
-              <input class="admin-input" id="charImage" placeholder="https://..." oninput="previewProfile()">
-              <div class="hint">외부 이미지 URL을 입력하세요. 서버 재시작에도 유지됩니다</div>
+              <label>프로필 이미지</label>
+              <div class="upload-zone" id="profileUploadZone" onclick="document.getElementById('profileFileInput').click()" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="this.classList.remove('dragover')" ondrop="event.preventDefault();this.classList.remove('dragover');handleProfileFileDrop(event)">
+                <i class="fas fa-cloud-upload-alt"></i>
+                <p>이미지 파일을 드래그하거나 클릭하여 업로드</p>
+                <div class="upload-hint">JPG, PNG, WebP (최대 25MB)</div>
+              </div>
+              <input type="file" id="profileFileInput" accept="image/*" style="display:none" onchange="handleProfileFileSelect(this)">
+              <div class="upload-progress" id="profileUploadProgress"><div class="upload-progress-bar" id="profileUploadBar"></div></div>
+              <div id="profileFilePreview"></div>
+              <div class="upload-or">또는</div>
+              <input class="admin-input" id="charImage" placeholder="이미지 URL을 직접 입력..." oninput="previewProfile()">
+              <div class="hint">파일 업로드 또는 외부 URL 입력. 서버 재시작에도 유지됩니다</div>
             </div>
             <div class="btn-row"><button class="btn btn-primary" onclick="saveBasic()"><i class="fas fa-save"></i> 저장</button></div>
           </div>
@@ -1767,8 +1945,17 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
               <div class="hint">AI 응답에 이 단어가 포함되면 이미지가 자동 표시됩니다</div>
             </div>
             <div class="field">
-              <label>이미지 URL</label>
-              <input class="admin-input" id="siImageUrl" placeholder="https://...">
+              <label>이미지</label>
+              <div class="upload-zone" id="siUploadZone" onclick="document.getElementById('siFileInput').click()" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="this.classList.remove('dragover')" ondrop="event.preventDefault();this.classList.remove('dragover');handleSIFileDrop(event)">
+                <i class="fas fa-cloud-upload-alt"></i>
+                <p>이미지 파일을 드래그하거나 클릭</p>
+                <div class="upload-hint">JPG, PNG, WebP (최대 25MB)</div>
+              </div>
+              <input type="file" id="siFileInput" accept="image/*" style="display:none" onchange="handleSIFileSelect(this)">
+              <div class="upload-progress" id="siUploadProgress"><div class="upload-progress-bar" id="siUploadBar"></div></div>
+              <div id="siFilePreview"></div>
+              <div class="upload-or">또는</div>
+              <input class="admin-input" id="siImageUrl" placeholder="이미지 URL을 직접 입력...">
             </div>
             <div class="field">
               <label>설명 (선택)</label>
@@ -1832,6 +2019,55 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
             </div>
           </div>
           <div class="btn-row"><button class="btn btn-primary" onclick="saveLore()"><i class="fas fa-save"></i> 저장</button></div>
+        </div>
+      </div>
+
+      <!-- Step 7: Video Management -->
+      <div class="panel" id="panel-step7">
+        <div class="content-header"><h2>Step 7 — 동영상 관리</h2><p>캐릭터 관련 동영상 클립을 등록합니다. 랜딩 페이지에 표시됩니다</p></div>
+        <div class="content-body">
+          <div class="card">
+            <div class="card-title"><i class="fas fa-plus-circle"></i> 새 동영상 등록</div>
+            <div class="field">
+              <label>제목</label>
+              <input class="admin-input" id="vidTitle" placeholder="동영상 클립 제목">
+            </div>
+            <div class="field">
+              <label>동영상</label>
+              <div class="upload-zone" id="vidUploadZone" onclick="document.getElementById('vidFileInput').click()" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="this.classList.remove('dragover')" ondrop="event.preventDefault();this.classList.remove('dragover');handleVidFileDrop(event)">
+                <i class="fas fa-video"></i>
+                <p>동영상 파일을 드래그하거나 클릭하여 업로드</p>
+                <div class="upload-hint">MP4, WebM, MOV (최대 25MB)</div>
+              </div>
+              <input type="file" id="vidFileInput" accept="video/*" style="display:none" onchange="handleVidFileSelect(this)">
+              <div class="upload-progress" id="vidUploadProgress"><div class="upload-progress-bar" id="vidUploadBar"></div></div>
+              <div id="vidFilePreview"></div>
+              <div class="upload-or">또는</div>
+              <input class="admin-input" id="vidUrl" placeholder="동영상 URL을 직접 입력...">
+            </div>
+            <div class="field">
+              <label>썸네일 이미지 (선택)</label>
+              <div class="upload-zone" id="vidThumbUploadZone" onclick="document.getElementById('vidThumbFileInput').click()" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="this.classList.remove('dragover')" ondrop="event.preventDefault();this.classList.remove('dragover');handleVidThumbFileDrop(event)">
+                <i class="fas fa-image"></i>
+                <p>썸네일 이미지를 드래그하거나 클릭</p>
+                <div class="upload-hint">JPG, PNG, WebP (최대 25MB)</div>
+              </div>
+              <input type="file" id="vidThumbFileInput" accept="image/*" style="display:none" onchange="handleVidThumbFileSelect(this)">
+              <div class="upload-progress" id="vidThumbUploadProgress"><div class="upload-progress-bar" id="vidThumbUploadBar"></div></div>
+              <div id="vidThumbFilePreview"></div>
+              <div class="upload-or">또는</div>
+              <input class="admin-input" id="vidThumbUrl" placeholder="썸네일 이미지 URL (비워두면 자동 생성)">
+            </div>
+            <div class="field">
+              <label>설명 (선택)</label>
+              <input class="admin-input" id="vidDesc" placeholder="동영상에 대한 간단한 설명">
+            </div>
+            <div class="btn-row"><button class="btn btn-primary" onclick="addVideo()"><i class="fas fa-plus"></i> 등록</button></div>
+          </div>
+          <div class="card">
+            <div class="card-title"><i class="fas fa-film"></i> 등록된 동영상</div>
+            <div class="vid-list" id="vidList"><div style="font-size:13px;color:var(--muted)">등록된 동영상이 없습니다</div></div>
+          </div>
         </div>
       </div>
 
@@ -1924,6 +2160,7 @@ async function loadCharacter() {
   previewProfile()
   renderSpecs(charData.specs || [])
   renderSituationImages(charData.situationImages || [])
+  renderVideos(charData.videos || [])
 }
 
 async function loadStats() {
@@ -1999,11 +2236,13 @@ async function addSituationImage() {
   var trigger = document.getElementById('siTrigger').value.trim()
   var imageUrl = document.getElementById('siImageUrl').value.trim()
   var desc = document.getElementById('siDesc').value.trim()
-  if (!trigger || !imageUrl) { toast('트리거와 이미지 URL은 필수입니다'); return }
+  if (!trigger || !imageUrl) { toast('트리거와 이미지 (URL 또는 파일 업로드)는 필수입니다'); return }
   await fetch('/api/admin/character/situation', { method:'POST', headers:ah(), body:JSON.stringify({trigger:trigger,imageUrl:imageUrl,description:desc}) })
   document.getElementById('siTrigger').value = ''
   document.getElementById('siImageUrl').value = ''
   document.getElementById('siDesc').value = ''
+  clearFilePreview('siFilePreview')
+  siUploadedUrl = ''
   await loadCharacter()
   toast('✅ 상황 이미지 등록됨')
 }
@@ -2062,7 +2301,7 @@ function showPanel(id, btn) {
   var panel = document.getElementById('panel-'+id)
   if (panel) panel.classList.add('active')
   if (btn) btn.classList.add('active')
-  var titles = {dashboard:'통계 요약',step1:'기본 정보',step2:'오프닝 설정',step3:'캐릭터 프롬프트',step4:'상황 이미지',step5:'캐릭터 상세',step6:'세계관 & 스펙',apikeys:'API 키 관리',danger:'위험 구역'}
+  var titles = {dashboard:'통계 요약',step1:'기본 정보',step2:'오프닝 설정',step3:'캐릭터 프롬프트',step4:'상황 이미지',step5:'캐릭터 상세',step6:'세계관 & 스펙',step7:'동영상 관리',apikeys:'API 키 관리',danger:'위험 구역'}
   document.getElementById('mobileTitle').textContent = titles[id] || ''
   closeSidebar()
 }
@@ -2083,6 +2322,188 @@ function toast(msg) {
   setTimeout(function(){t.style.display='none'}, 2500)
 }
 function esc(s) { var d = document.createElement('div'); d.textContent = s||''; return d.innerHTML }
+
+// ═══ FILE UPLOAD HELPERS ═══
+async function uploadFile(file, progressBarId, progressWrapId) {
+  var progressWrap = document.getElementById(progressWrapId)
+  var progressBar = document.getElementById(progressBarId)
+  progressWrap.style.display = 'block'
+  progressBar.style.width = '30%'
+
+  var formData = new FormData()
+  formData.append('file', file)
+
+  try {
+    progressBar.style.width = '60%'
+    var r = await fetch('/api/admin/upload', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + adminToken },
+      body: formData
+    })
+    progressBar.style.width = '90%'
+    var d = await r.json()
+    if (!r.ok) { toast('❌ ' + (d.error || '업로드 실패')); return null }
+    progressBar.style.width = '100%'
+    setTimeout(function() { progressWrap.style.display = 'none'; progressBar.style.width = '0' }, 500)
+    return d
+  } catch(e) {
+    toast('❌ 업로드 중 오류 발생')
+    progressWrap.style.display = 'none'
+    progressBar.style.width = '0'
+    return null
+  }
+}
+
+function showFilePreview(previewId, url, name, type) {
+  var wrap = document.getElementById(previewId)
+  var isVideo = type && type.startsWith('video/')
+  var media = isVideo
+    ? '<video src="'+url+'" style="width:48px;height:48px;border-radius:8px;object-fit:cover"></video>'
+    : '<img src="'+url+'" style="width:48px;height:48px;border-radius:8px;object-fit:cover" onerror="this.style.display=\\'none\\'">'
+  wrap.innerHTML = '<div class="file-preview">' + media + '<span class="file-name">' + esc(name) + '</span><span class="file-remove" onclick="clearFilePreview(\\''+previewId+'\\')"><i class="fas fa-times-circle"></i></span></div>'
+  wrap.dataset.uploadedUrl = url
+}
+
+function clearFilePreview(previewId) {
+  var wrap = document.getElementById(previewId)
+  wrap.innerHTML = ''
+  delete wrap.dataset.uploadedUrl
+}
+
+// Profile image upload
+async function handleProfileFileSelect(input) {
+  if (!input.files || !input.files[0]) return
+  var file = input.files[0]
+  if (!file.type.startsWith('image/')) { toast('이미지 파일만 업로드 가능합니다'); return }
+  var result = await uploadFile(file, 'profileUploadBar', 'profileUploadProgress')
+  if (result) {
+    document.getElementById('charImage').value = result.url
+    showFilePreview('profileFilePreview', result.url, result.fileName, result.mimeType)
+    previewProfile()
+    toast('✅ 이미지 업로드 완료')
+  }
+  input.value = ''
+}
+function handleProfileFileDrop(e) {
+  var files = e.dataTransfer.files
+  if (files && files[0]) {
+    document.getElementById('profileFileInput').files = files
+    handleProfileFileSelect(document.getElementById('profileFileInput'))
+  }
+}
+
+// Situation image upload
+var siUploadedUrl = ''
+async function handleSIFileSelect(input) {
+  if (!input.files || !input.files[0]) return
+  var file = input.files[0]
+  if (!file.type.startsWith('image/')) { toast('이미지 파일만 업로드 가능합니다'); return }
+  var result = await uploadFile(file, 'siUploadBar', 'siUploadProgress')
+  if (result) {
+    siUploadedUrl = result.url
+    document.getElementById('siImageUrl').value = result.url
+    showFilePreview('siFilePreview', result.url, result.fileName, result.mimeType)
+    toast('✅ 이미지 업로드 완료')
+  }
+  input.value = ''
+}
+function handleSIFileDrop(e) {
+  var files = e.dataTransfer.files
+  if (files && files[0]) {
+    document.getElementById('siFileInput').files = files
+    handleSIFileSelect(document.getElementById('siFileInput'))
+  }
+}
+
+// Video upload
+var vidUploadedUrl = ''
+async function handleVidFileSelect(input) {
+  if (!input.files || !input.files[0]) return
+  var file = input.files[0]
+  if (!file.type.startsWith('video/')) { toast('동영상 파일만 업로드 가능합니다'); return }
+  var result = await uploadFile(file, 'vidUploadBar', 'vidUploadProgress')
+  if (result) {
+    vidUploadedUrl = result.url
+    document.getElementById('vidUrl').value = result.url
+    showFilePreview('vidFilePreview', result.url, result.fileName, result.mimeType)
+    toast('✅ 동영상 업로드 완료')
+  }
+  input.value = ''
+}
+function handleVidFileDrop(e) {
+  var files = e.dataTransfer.files
+  if (files && files[0]) {
+    document.getElementById('vidFileInput').files = files
+    handleVidFileSelect(document.getElementById('vidFileInput'))
+  }
+}
+
+// Video thumbnail upload
+var vidThumbUploadedUrl = ''
+async function handleVidThumbFileSelect(input) {
+  if (!input.files || !input.files[0]) return
+  var file = input.files[0]
+  if (!file.type.startsWith('image/')) { toast('이미지 파일만 업로드 가능합니다'); return }
+  var result = await uploadFile(file, 'vidThumbUploadBar', 'vidThumbUploadProgress')
+  if (result) {
+    vidThumbUploadedUrl = result.url
+    document.getElementById('vidThumbUrl').value = result.url
+    showFilePreview('vidThumbFilePreview', result.url, result.fileName, result.mimeType)
+    toast('✅ 썸네일 업로드 완료')
+  }
+  input.value = ''
+}
+function handleVidThumbFileDrop(e) {
+  var files = e.dataTransfer.files
+  if (files && files[0]) {
+    document.getElementById('vidThumbFileInput').files = files
+    handleVidThumbFileSelect(document.getElementById('vidThumbFileInput'))
+  }
+}
+
+// ═══ VIDEO MANAGEMENT ═══
+function renderVideos(videos) {
+  var list = document.getElementById('vidList')
+  if (!videos || videos.length === 0) {
+    list.innerHTML = '<div style="font-size:13px;color:var(--muted);padding:8px 0">등록된 동영상이 없습니다</div>'
+    return
+  }
+  var html = ''
+  for (var i = 0; i < videos.length; i++) {
+    var v = videos[i]
+    var thumb = v.thumbnailUrl
+      ? '<img src="'+esc(v.thumbnailUrl)+'" alt="" style="width:100%;height:100%;object-fit:cover" onerror="this.style.display=\\'none\\'">'
+      : ''
+    html += '<div class="vid-item"><div class="vid-thumb">' + thumb + '<i class="fas fa-play-circle"></i></div><div class="vid-info"><div class="vid-title">' + esc(v.title || '동영상') + '</div><div class="vid-desc">' + esc(v.description || v.videoUrl) + '</div></div><div class="vid-actions"><button class="btn btn-danger btn-sm" onclick="deleteVideo(\\''+v.id+'\\')"><i class="fas fa-trash"></i></button></div></div>'
+  }
+  list.innerHTML = html
+}
+
+async function addVideo() {
+  var title = document.getElementById('vidTitle').value.trim()
+  var videoUrl = document.getElementById('vidUrl').value.trim()
+  var thumbnailUrl = document.getElementById('vidThumbUrl').value.trim()
+  var description = document.getElementById('vidDesc').value.trim()
+  if (!videoUrl) { toast('동영상 URL 또는 파일 업로드는 필수입니다'); return }
+  await fetch('/api/admin/character/video', { method:'POST', headers:ah(), body:JSON.stringify({title:title,videoUrl:videoUrl,thumbnailUrl:thumbnailUrl,description:description}) })
+  document.getElementById('vidTitle').value = ''
+  document.getElementById('vidUrl').value = ''
+  document.getElementById('vidThumbUrl').value = ''
+  document.getElementById('vidDesc').value = ''
+  clearFilePreview('vidFilePreview')
+  clearFilePreview('vidThumbFilePreview')
+  vidUploadedUrl = ''
+  vidThumbUploadedUrl = ''
+  await loadCharacter()
+  toast('✅ 동영상 등록됨')
+}
+
+async function deleteVideo(id) {
+  if (!confirm('이 동영상을 삭제할까요?')) return
+  await fetch('/api/admin/character/video/'+id, { method:'DELETE', headers:ah() })
+  await loadCharacter()
+  toast('✅ 동영상 삭제됨')
+}
 </script>
 </body>
 </html>`
