@@ -638,6 +638,50 @@ app.post('/api/admin/reset-sessions', adminAuth, async (c) => {
   return c.json({ success: true })
 })
 
+// POST /api/admin/character/situation - Add situation image
+app.post('/api/admin/character/situation', adminAuth, async (c) => {
+  const { trigger, imageUrl, description } = await c.req.json()
+  if (!trigger || !imageUrl) return c.json({ error: '트리거와 이미지 URL은 필수입니다.' }, 400)
+  const current = await getCharacterConfig(c.env.KV)
+  const si = { id: 'si_' + Date.now(), trigger, imageUrl, description: description || '' }
+  const images = [...(current.situationImages || []), si]
+  await c.env.KV.put('character_config', JSON.stringify({ ...current, situationImages: images }))
+  return c.json({ success: true, situationImage: si })
+})
+
+// PUT /api/admin/character/situation/:id - Update situation image
+app.put('/api/admin/character/situation/:id', adminAuth, async (c) => {
+  const id = c.req.param('id')
+  const { trigger, imageUrl, description } = await c.req.json()
+  const current = await getCharacterConfig(c.env.KV)
+  const images = (current.situationImages || []).map((si: any) =>
+    si.id === id ? { ...si, trigger: trigger ?? si.trigger, imageUrl: imageUrl ?? si.imageUrl, description: description ?? si.description } : si
+  )
+  await c.env.KV.put('character_config', JSON.stringify({ ...current, situationImages: images }))
+  return c.json({ success: true })
+})
+
+// DELETE /api/admin/character/situation/:id - Delete situation image
+app.delete('/api/admin/character/situation/:id', adminAuth, async (c) => {
+  const id = c.req.param('id')
+  const current = await getCharacterConfig(c.env.KV)
+  const images = (current.situationImages || []).filter((si: any) => si.id !== id)
+  await c.env.KV.put('character_config', JSON.stringify({ ...current, situationImages: images }))
+  return c.json({ success: true })
+})
+
+// GET /api/admin/stats - Basic stats
+app.get('/api/admin/stats', adminAuth, async (c) => {
+  const totalUsers = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM users WHERE is_guest = 0').first()
+  const totalGuests = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM users WHERE is_guest = 1').first()
+  const totalSessions = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM sessions').first()
+  return c.json({
+    members: (totalUsers as any)?.cnt || 0,
+    guests: (totalGuests as any)?.cnt || 0,
+    sessions: (totalSessions as any)?.cnt || 0
+  })
+})
+
 // ═══  STATIC / SPA  ═══
 
 // Serve admin page
@@ -1466,211 +1510,579 @@ const adminHTML = `<!DOCTYPE html>
 <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#0a0a10;--surface:#14141e;--surface2:#1c1c28;--border:#2a2a3a;--accent:#7c5cbf;--accent2:#a07de0;--text:#e8e8f0;--muted:#7777a0;--ok:#4caf89;--err:#e05050}
-body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',sans-serif}
-.admin-container{max-width:800px;margin:0 auto;padding:20px}
-.admin-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
-.admin-header h1{font-size:20px}
-#loginSection{max-width:400px;margin:100px auto;text-align:center}
-#loginSection h2{margin-bottom:20px}
-.admin-input{width:100%;padding:12px 16px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:14px;margin-bottom:12px;outline:none}
+:root{--bg:#0a0a10;--surface:#12121c;--surface2:#1a1a28;--surface3:#222232;--border:#2a2a3e;--accent:#7c5cbf;--accent2:#a07de0;--accent3:#c4a8ff;--text:#e8e8f0;--muted:#7777a0;--ok:#4caf89;--warn:#e0a060;--err:#e05050;--sidebar-w:260px}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',sans-serif}
+
+/* Login */
+#loginSection{display:flex;align-items:center;justify-content:center;height:100vh}
+.login-box{width:380px;background:var(--surface);border:1px solid var(--border);border-radius:20px;padding:40px 32px;text-align:center}
+.login-box h2{font-size:22px;margin-bottom:6px}
+.login-box p{font-size:13px;color:var(--muted);margin-bottom:24px}
+.login-box .icon{font-size:48px;margin-bottom:16px;display:block}
+
+/* Layout */
+#mainSection{display:none;height:100vh}
+.layout{display:flex;height:100%}
+
+/* Sidebar */
+.sidebar{width:var(--sidebar-w);background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto}
+.sidebar-header{padding:20px;border-bottom:1px solid var(--border)}
+.sidebar-header h1{font-size:16px;font-weight:700;display:flex;align-items:center;gap:8px}
+.sidebar-header p{font-size:11px;color:var(--muted);margin-top:4px}
+.sidebar-nav{flex:1;padding:12px 8px}
+.nav-section{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px;padding:12px 12px 6px;font-weight:700}
+.nav-item{display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:10px;font-size:13px;color:var(--text);cursor:pointer;transition:all .15s;margin-bottom:2px;border:none;background:none;width:100%;text-align:left;font-family:inherit}
+.nav-item:hover{background:var(--surface2)}
+.nav-item.active{background:rgba(124,92,191,.15);color:var(--accent3)}
+.nav-item i{width:18px;text-align:center;font-size:14px;color:var(--muted)}
+.nav-item.active i{color:var(--accent2)}
+.nav-item .step-num{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:6px;background:var(--surface3);font-size:10px;font-weight:700;color:var(--muted)}
+.nav-item.active .step-num{background:var(--accent);color:#fff}
+.sidebar-footer{padding:12px;border-top:1px solid var(--border)}
+.sidebar-footer a{display:flex;align-items:center;gap:8px;padding:10px 14px;border-radius:10px;font-size:13px;color:var(--accent2);text-decoration:none;transition:background .15s}
+.sidebar-footer a:hover{background:var(--surface2)}
+
+/* Content */
+.content{flex:1;overflow-y:auto;padding:0}
+.content-header{position:sticky;top:0;z-index:10;padding:20px 32px 16px;background:rgba(10,10,16,.9);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.content-header h2{font-size:20px;font-weight:700;margin-bottom:2px}
+.content-header p{font-size:12px;color:var(--muted)}
+.content-body{padding:24px 32px 60px}
+
+/* Panel */
+.panel{display:none}
+.panel.active{display:block}
+
+/* Form Elements */
+.field{margin-bottom:20px}
+.field label{display:block;font-size:12px;color:var(--muted);font-weight:600;margin-bottom:6px;letter-spacing:.3px}
+.field .hint{font-size:11px;color:var(--muted);margin-top:4px;opacity:.7}
+.admin-input{width:100%;padding:11px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:14px;outline:none;transition:border-color .2s}
 .admin-input:focus{border-color:var(--accent)}
-.admin-btn{padding:12px 24px;background:var(--accent);color:#fff;border:none;border-radius:10px;cursor:pointer;font-size:14px;font-weight:600}
-.admin-btn:hover{opacity:.9}
-.admin-btn.danger{background:var(--err)}
-.admin-textarea{width:100%;min-height:200px;padding:12px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;font-family:monospace;resize:vertical;outline:none;line-height:1.6}
+.admin-textarea{width:100%;padding:12px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;font-family:'SF Mono',Menlo,monospace;resize:vertical;outline:none;line-height:1.7;transition:border-color .2s}
 .admin-textarea:focus{border-color:var(--accent)}
-.section{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px;margin-bottom:16px}
-.section h3{font-size:15px;color:var(--accent2);margin-bottom:14px}
-.section label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-weight:600;margin-top:12px}
-.section label:first-of-type{margin-top:0}
-.status{padding:6px 12px;border-radius:8px;font-size:12px;display:inline-block}
-.status.ok{background:rgba(76,175,137,.15);color:var(--ok)}
-.status.err{background:rgba(224,80,80,.15);color:var(--err)}
-.toast{position:fixed;top:20px;right:20px;padding:12px 20px;background:var(--ok);color:#fff;border-radius:10px;font-size:14px;z-index:1000;display:none;animation:fadeIn .3s}
-@keyframes fadeIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}
-#mainSection{display:none}
+
+/* Buttons */
+.btn{padding:10px 20px;border:none;border-radius:10px;cursor:pointer;font-size:13px;font-weight:600;transition:all .15s;font-family:inherit}
+.btn:active{transform:scale(.97)}
+.btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff}
+.btn-primary:hover{opacity:.9}
+.btn-secondary{background:var(--surface3);color:var(--text);border:1px solid var(--border)}
+.btn-secondary:hover{border-color:var(--accent)}
+.btn-danger{background:rgba(224,80,80,.15);color:var(--err);border:1px solid rgba(224,80,80,.3)}
+.btn-danger:hover{background:rgba(224,80,80,.25)}
+.btn-sm{padding:7px 14px;font-size:12px;border-radius:8px}
+.btn-row{display:flex;gap:10px;margin-top:16px}
+
+/* Cards */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px;margin-bottom:16px}
+.card-title{font-size:14px;font-weight:600;color:var(--accent2);margin-bottom:14px;display:flex;align-items:center;gap:8px}
+
+/* Stats */
+.stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:24px}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px;text-align:center}
+.stat-value{font-size:28px;font-weight:800;color:var(--accent3);margin-bottom:4px}
+.stat-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+
+/* Situation Images */
+.si-list{display:flex;flex-direction:column;gap:10px;margin-bottom:16px}
+.si-item{display:flex;align-items:center;gap:12px;background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:12px}
+.si-thumb{width:48px;height:48px;border-radius:8px;object-fit:cover;background:var(--surface3)}
+.si-info{flex:1;min-width:0}
+.si-trigger{font-size:13px;font-weight:600;color:var(--accent3)}
+.si-desc{font-size:11px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.si-actions{display:flex;gap:6px}
+
+/* Profile preview */
+.profile-preview{width:80px;height:80px;border-radius:50%;object-fit:cover;border:3px solid var(--accent);margin-bottom:12px}
+
+/* Toast */
+.toast{position:fixed;top:20px;right:20px;padding:12px 20px;background:var(--ok);color:#fff;border-radius:10px;font-size:13px;font-weight:600;z-index:9999;display:none;animation:toastIn .3s ease;box-shadow:0 4px 20px rgba(0,0,0,.3)}
+@keyframes toastIn{from{opacity:0;transform:translateY(-10px) scale(.95)}to{opacity:1;transform:translateY(0) scale(1)}}
+
+/* Responsive */
+@media(max-width:768px){
+  .sidebar{position:fixed;left:-280px;z-index:100;height:100%;transition:left .3s;box-shadow:4px 0 20px rgba(0,0,0,.5)}
+  .sidebar.open{left:0}
+  .mobile-header{display:flex !important;align-items:center;gap:12px;padding:14px 16px;background:var(--surface);border-bottom:1px solid var(--border)}
+  .mobile-header button{background:none;border:none;color:var(--text);font-size:20px;cursor:pointer}
+  .mobile-header h2{font-size:15px;flex:1}
+  .content-body{padding:16px}
+  .stats-grid{grid-template-columns:1fr}
+  .sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:99}
+  .sidebar-overlay.show{display:block}
+}
+@media(min-width:769px){
+  .mobile-header{display:none !important}
+  .sidebar-overlay{display:none !important}
+}
 </style>
 </head>
 <body>
-<div class="admin-container">
-  <!-- Login -->
-  <div id="loginSection">
-    <h2>🔐 관리자 로그인</h2>
-    <input class="admin-input" id="adminPw" type="password" placeholder="관리자 비밀번호">
-    <br><br>
-    <button class="admin-btn" onclick="adminLogin()">로그인</button>
-    <p id="adminError" style="color:var(--err);margin-top:12px;display:none"></p>
+
+<!-- Login -->
+<div id="loginSection">
+  <div class="login-box">
+    <span class="icon">🔐</span>
+    <h2>관리자 패널</h2>
+    <p>비밀번호를 입력하세요</p>
+    <input class="admin-input" id="adminPw" type="password" placeholder="관리자 비밀번호" onkeydown="if(event.key==='Enter')adminLogin()">
+    <div class="btn-row" style="justify-content:center;margin-top:16px">
+      <button class="btn btn-primary" onclick="adminLogin()" style="width:100%">로그인</button>
+    </div>
+    <p id="adminError" style="color:var(--err);font-size:12px;margin-top:12px;display:none"></p>
   </div>
+</div>
 
-  <!-- Main -->
-  <div id="mainSection">
-    <div class="admin-header">
-      <h1>⚙️ 관리자 패널</h1>
-      <button class="admin-btn" onclick="window.location='/'">사용자 채팅으로</button>
-    </div>
+<!-- Main Layout -->
+<div id="mainSection">
+  <div class="sidebar-overlay" id="sidebarOverlay" onclick="closeSidebar()"></div>
+  <div class="layout">
+    <!-- Sidebar -->
+    <nav class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <h1><i class="fas fa-cog"></i> 관리자 패널</h1>
+        <p>캐릭터 설정 관리</p>
+      </div>
+      <div class="sidebar-nav">
+        <div class="nav-section">대시보드</div>
+        <button class="nav-item active" onclick="showPanel('dashboard',this)"><i class="fas fa-chart-pie"></i> 통계 요약</button>
 
-    <!-- API Keys -->
-    <div class="section">
-      <h3>🔑 API 키 설정</h3>
-      <label>OpenAI API Key</label>
-      <input class="admin-input" id="apiKey" type="password" placeholder="sk-...">
-      <label>Base URL</label>
-      <input class="admin-input" id="apiBaseUrl" value="https://api.openai.com/v1" placeholder="https://api.openai.com/v1">
-      <br>
-      <button class="admin-btn" onclick="saveKeys()">저장</button>
-    </div>
+        <div class="nav-section">캐릭터 설정</div>
+        <button class="nav-item" onclick="showPanel('step1',this)"><span class="step-num">1</span> 기본 정보</button>
+        <button class="nav-item" onclick="showPanel('step2',this)"><span class="step-num">2</span> 오프닝 설정</button>
+        <button class="nav-item" onclick="showPanel('step3',this)"><span class="step-num">3</span> 캐릭터 프롬프트</button>
+        <button class="nav-item" onclick="showPanel('step4',this)"><span class="step-num">4</span> 상황 이미지</button>
+        <button class="nav-item" onclick="showPanel('step5',this)"><span class="step-num">5</span> 캐릭터 상세</button>
+        <button class="nav-item" onclick="showPanel('step6',this)"><span class="step-num">6</span> 세계관 & 스펙</button>
 
-    <!-- Character Basic -->
-    <div class="section">
-      <h3>📝 기본 정보</h3>
-      <label>캐릭터 이름</label>
-      <input class="admin-input" id="charName">
-      <label>한 줄 소개</label>
-      <input class="admin-input" id="charIntro">
-      <label>프로필 이미지 URL</label>
-      <input class="admin-input" id="charImage" placeholder="https://...">
-      <br>
-      <button class="admin-btn" onclick="saveBasic()">저장</button>
-    </div>
+        <div class="nav-section">시스템</div>
+        <button class="nav-item" onclick="showPanel('apikeys',this)"><i class="fas fa-key"></i> API 키 관리</button>
+        <button class="nav-item" onclick="showPanel('danger',this)"><i class="fas fa-exclamation-triangle"></i> 위험 구역</button>
+      </div>
+      <div class="sidebar-footer">
+        <a href="/"><i class="fas fa-comment-dots"></i> 사용자 채팅으로</a>
+      </div>
+    </nav>
 
-    <!-- Opening -->
-    <div class="section">
-      <h3>💬 오프닝 설정</h3>
-      <label>오프닝 메시지</label>
-      <textarea class="admin-textarea" id="charOpening"></textarea>
-      <label>플레이 가이드</label>
-      <input class="admin-input" id="charPlayGuide">
-      <br>
-      <button class="admin-btn" onclick="saveOpening()">저장</button>
-    </div>
+    <!-- Content -->
+    <main class="content">
+      <!-- Mobile Header -->
+      <div class="mobile-header">
+        <button onclick="openSidebar()"><i class="fas fa-bars"></i></button>
+        <h2 id="mobileTitle">통계 요약</h2>
+      </div>
 
-    <!-- Prompt -->
-    <div class="section">
-      <h3>🧠 캐릭터 프롬프트</h3>
-      <textarea class="admin-textarea" id="charPrompt" style="min-height:400px"></textarea>
-      <br>
-      <button class="admin-btn" onclick="savePrompt()">저장</button>
-    </div>
+      <!-- Dashboard -->
+      <div class="panel active" id="panel-dashboard">
+        <div class="content-header"><h2>📊 통계 요약</h2><p>서비스 현황을 한눈에 확인하세요</p></div>
+        <div class="content-body">
+          <div class="stats-grid">
+            <div class="stat-card"><div class="stat-value" id="statMembers">-</div><div class="stat-label">회원 수</div></div>
+            <div class="stat-card"><div class="stat-value" id="statGuests">-</div><div class="stat-label">게스트 수</div></div>
+            <div class="stat-card"><div class="stat-value" id="statSessions">-</div><div class="stat-label">세션 수</div></div>
+          </div>
+          <div class="card">
+            <div class="card-title"><i class="fas fa-info-circle"></i> 시스템 정보</div>
+            <div id="sysInfo" style="font-size:13px;color:var(--muted);line-height:1.8"></div>
+          </div>
+        </div>
+      </div>
 
-    <!-- Detail -->
-    <div class="section">
-      <h3>📖 캐릭터 상세</h3>
-      <textarea class="admin-textarea" id="charDetail" style="min-height:100px"></textarea>
-      <label>장르</label>
-      <input class="admin-input" id="charGenre" placeholder="fantasy">
-      <label>해시태그 (쉼표 구분)</label>
-      <input class="admin-input" id="charHashtags" placeholder="#츤데레, #헌터">
-      <br>
-      <button class="admin-btn" onclick="saveDetail()">저장</button>
-    </div>
+      <!-- Step 1: Basic Info -->
+      <div class="panel" id="panel-step1">
+        <div class="content-header"><h2>Step 1 — 기본 정보</h2><p>캐릭터의 이름, 소개, 프로필 이미지를 설정합니다</p></div>
+        <div class="content-body">
+          <div class="card">
+            <div id="profilePreviewWrap" style="text-align:center;margin-bottom:16px"></div>
+            <div class="field">
+              <label>캐릭터 이름</label>
+              <input class="admin-input" id="charName" placeholder="캐릭터 이름">
+              <div class="hint">사이트 제목, 헤더, 랜딩 페이지에 표시됩니다</div>
+            </div>
+            <div class="field">
+              <label>한 줄 소개</label>
+              <input class="admin-input" id="charIntro" placeholder="캐릭터 한 줄 소개">
+              <div class="hint">채팅 헤더 서브타이틀에 표시됩니다</div>
+            </div>
+            <div class="field">
+              <label>프로필 이미지 URL</label>
+              <input class="admin-input" id="charImage" placeholder="https://..." oninput="previewProfile()">
+              <div class="hint">외부 이미지 URL을 입력하세요. 서버 재시작에도 유지됩니다</div>
+            </div>
+            <div class="btn-row"><button class="btn btn-primary" onclick="saveBasic()"><i class="fas fa-save"></i> 저장</button></div>
+          </div>
+        </div>
+      </div>
 
-    <!-- Lore & Specs -->
-    <div class="section">
-      <h3>🌍 세계관 & 스펙</h3>
-      <label>세계관</label>
-      <textarea class="admin-textarea" id="charLore" style="min-height:100px"></textarea>
-      <label>스펙 (JSON)</label>
-      <textarea class="admin-textarea" id="charSpecs" style="min-height:100px">[{"label":"등급","value":"S+"}]</textarea>
-      <br>
-      <button class="admin-btn" onclick="saveLore()">저장</button>
-    </div>
+      <!-- Step 2: Opening -->
+      <div class="panel" id="panel-step2">
+        <div class="content-header"><h2>Step 2 — 오프닝 설정</h2><p>채팅 시작 시 캐릭터의 첫 메시지와 안내 문구를 설정합니다</p></div>
+        <div class="content-body">
+          <div class="card">
+            <div class="field">
+              <label>오프닝 메시지</label>
+              <textarea class="admin-textarea" id="charOpening" style="min-height:200px" placeholder="*상황묘사*&#10;&quot;대사&quot;&#10;&#10;*상황묘사*&#10;&quot;대사&quot;"></textarea>
+              <div class="hint">*상황묘사* + "대사" 형식으로 작성하세요. 채팅 시작 시 표시됩니다</div>
+            </div>
+            <div class="field">
+              <label>플레이 가이드</label>
+              <input class="admin-input" id="charPlayGuide" placeholder="채팅 화면 상단에 표시되는 안내 문구">
+              <div class="hint">채팅 화면 상단에 작은 글씨로 표시됩니다</div>
+            </div>
+            <div class="btn-row"><button class="btn btn-primary" onclick="saveOpening()"><i class="fas fa-save"></i> 저장</button></div>
+          </div>
+        </div>
+      </div>
 
-    <!-- Danger Zone -->
-    <div class="section">
-      <h3>⚠️ 위험 구역</h3>
-      <button class="admin-btn danger" onclick="resetSessions()">전체 세션 초기화</button>
-    </div>
+      <!-- Step 3: Prompt -->
+      <div class="panel" id="panel-step3">
+        <div class="content-header"><h2>Step 3 — 캐릭터 프롬프트</h2><p>캐릭터의 성격, 말투, 규칙을 정의하는 시스템 프롬프트</p></div>
+        <div class="content-body">
+          <div class="card">
+            <div class="card-title"><i class="fas fa-lightbulb"></i> 작성 팁</div>
+            <div style="font-size:12px;color:var(--muted);line-height:1.8">
+              <b>{{USER_NAME}}</b> 변수를 사용하면 사용자 호칭으로 자동 치환됩니다.<br>
+              <b>출력 형식</b>을 반드시 포함하세요 — 파싱이 정상 동작하려면 아래 형식이 필요합니다:<br>
+              <code style="background:var(--surface3);padding:2px 6px;border-radius:4px;font-size:11px">*[상황묘사]* "대사" 2세트</code>
+            </div>
+          </div>
+          <div class="field">
+            <label>시스템 프롬프트</label>
+            <textarea class="admin-textarea" id="charPrompt" style="min-height:500px"></textarea>
+          </div>
+          <div class="btn-row"><button class="btn btn-primary" onclick="savePrompt()"><i class="fas fa-save"></i> 저장</button></div>
+        </div>
+      </div>
+
+      <!-- Step 4: Situation Images -->
+      <div class="panel" id="panel-step4">
+        <div class="content-header"><h2>Step 4 — 상황 이미지</h2><p>트리거 키워드에 맞는 이미지를 등록합니다. AI 응답에 키워드가 포함되면 자동 표시됩니다</p></div>
+        <div class="content-body">
+          <div class="card">
+            <div class="card-title"><i class="fas fa-plus-circle"></i> 새 상황 이미지 등록</div>
+            <div class="field">
+              <label>트리거 키워드</label>
+              <input class="admin-input" id="siTrigger" placeholder="예: 포옹, 키스, 눈물">
+              <div class="hint">AI 응답에 이 단어가 포함되면 이미지가 자동 표시됩니다</div>
+            </div>
+            <div class="field">
+              <label>이미지 URL</label>
+              <input class="admin-input" id="siImageUrl" placeholder="https://...">
+            </div>
+            <div class="field">
+              <label>설명 (선택)</label>
+              <input class="admin-input" id="siDesc" placeholder="이 상황에 대한 간단한 설명">
+            </div>
+            <div class="btn-row"><button class="btn btn-primary" onclick="addSituationImage()"><i class="fas fa-plus"></i> 등록</button></div>
+          </div>
+          <div class="card">
+            <div class="card-title"><i class="fas fa-images"></i> 등록된 상황 이미지</div>
+            <div class="si-list" id="siList"><div style="font-size:13px;color:var(--muted)">등록된 상황 이미지가 없습니다</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Step 5: Detail -->
+      <div class="panel" id="panel-step5">
+        <div class="content-header"><h2>Step 5 — 캐릭터 상세</h2><p>랜딩 페이지에 표시되는 상세 정보를 설정합니다</p></div>
+        <div class="content-body">
+          <div class="card">
+            <div class="field">
+              <label>캐릭터 상세 설명</label>
+              <textarea class="admin-textarea" id="charDetail" style="min-height:120px" placeholder="랜딩 페이지 Character 섹션에 표시됩니다"></textarea>
+            </div>
+            <div class="field">
+              <label>장르</label>
+              <select class="admin-input" id="charGenre" style="appearance:auto">
+                <option value="romance">romance</option>
+                <option value="fantasy">fantasy</option>
+                <option value="action">action</option>
+                <option value="daily">daily</option>
+                <option value="thriller">thriller</option>
+                <option value="sf">sf</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>해시태그</label>
+              <input class="admin-input" id="charHashtags" placeholder="#츤데레, #헌터, #남친봇">
+              <div class="hint">쉼표로 구분. 랜딩 히어로 이미지 오버레이에 표시됩니다</div>
+            </div>
+            <div class="btn-row"><button class="btn btn-primary" onclick="saveDetail()"><i class="fas fa-save"></i> 저장</button></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Step 6: Lore & Specs -->
+      <div class="panel" id="panel-step6">
+        <div class="content-header"><h2>Step 6 — 세계관 & 스펙</h2><p>캐릭터의 세계관과 스펙 카드를 설정합니다</p></div>
+        <div class="content-body">
+          <div class="card">
+            <div class="field">
+              <label>세계관</label>
+              <textarea class="admin-textarea" id="charLore" style="min-height:150px" placeholder="랜딩 페이지 세계관 섹션에 표시됩니다 (최대 1500자)"></textarea>
+              <div class="hint">최대 1500자. 랜딩 페이지 World 섹션에 표시됩니다</div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-title"><i class="fas fa-chart-bar"></i> 스펙 카드 (최대 6개)</div>
+            <div id="specsEditor"></div>
+            <div class="btn-row">
+              <button class="btn btn-secondary btn-sm" onclick="addSpecRow()"><i class="fas fa-plus"></i> 스펙 추가</button>
+            </div>
+          </div>
+          <div class="btn-row"><button class="btn btn-primary" onclick="saveLore()"><i class="fas fa-save"></i> 저장</button></div>
+        </div>
+      </div>
+
+      <!-- API Keys -->
+      <div class="panel" id="panel-apikeys">
+        <div class="content-header"><h2>🔑 API 키 관리</h2><p>채팅 LLM에 사용할 API 키를 설정합니다</p></div>
+        <div class="content-body">
+          <div class="card">
+            <div class="card-title"><i class="fas fa-robot"></i> Claude / OpenAI 호환 API</div>
+            <div class="field">
+              <label>API Key</label>
+              <input class="admin-input" id="apiKey" type="password" placeholder="sk-...">
+              <div class="hint">.env에 없어도 여기서 입력 가능. 런타임에 즉시 적용됩니다</div>
+            </div>
+            <div class="field">
+              <label>Base URL</label>
+              <input class="admin-input" id="apiBaseUrl" value="https://api.openai.com/v1" placeholder="https://api.openai.com/v1">
+              <div class="hint">OpenAI 호환 API 사용 시 Base URL을 변경하세요</div>
+            </div>
+            <div class="btn-row"><button class="btn btn-primary" onclick="saveKeys()"><i class="fas fa-save"></i> 저장</button></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Danger Zone -->
+      <div class="panel" id="panel-danger">
+        <div class="content-header"><h2>⚠️ 위험 구역</h2><p>되돌릴 수 없는 작업입니다. 신중하게 진행하세요</p></div>
+        <div class="content-body">
+          <div class="card" style="border-color:rgba(224,80,80,.3)">
+            <div class="card-title" style="color:var(--err)"><i class="fas fa-trash-alt"></i> 전체 세션 초기화</div>
+            <p style="font-size:13px;color:var(--muted);margin-bottom:16px">모든 사용자의 대화 히스토리와 토큰 사용량이 초기화됩니다. 회원 계정은 유지됩니다.</p>
+            <button class="btn btn-danger" onclick="resetSessions()"><i class="fas fa-exclamation-triangle"></i> 전체 세션 초기화</button>
+          </div>
+        </div>
+      </div>
+
+    </main>
   </div>
 </div>
 
 <div class="toast" id="toast"></div>
 
 <script>
-let adminToken = sessionStorage.getItem('adminToken')
+var adminToken = sessionStorage.getItem('adminToken')
+var charData = {}
 
-if (adminToken) {
-  document.getElementById('loginSection').style.display = 'none'
-  document.getElementById('mainSection').style.display = 'block'
-  loadCharacter()
-}
+if (adminToken) { showMain() }
 
 async function adminLogin() {
-  const pw = document.getElementById('adminPw').value
+  var pw = document.getElementById('adminPw').value
+  var errEl = document.getElementById('adminError')
+  errEl.style.display = 'none'
   try {
-    const r = await fetch('/api/admin/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pw }) })
-    const d = await r.json()
-    if (!r.ok) { document.getElementById('adminError').textContent = d.error; document.getElementById('adminError').style.display = 'block'; return }
+    var r = await fetch('/api/admin/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:pw}) })
+    var d = await r.json()
+    if (!r.ok) { errEl.textContent = d.error; errEl.style.display = 'block'; return }
     adminToken = d.token
     sessionStorage.setItem('adminToken', d.token)
-    document.getElementById('loginSection').style.display = 'none'
-    document.getElementById('mainSection').style.display = 'block'
-    loadCharacter()
-  } catch (e) { alert('Error') }
+    showMain()
+  } catch(e) { errEl.textContent = 'Network error'; errEl.style.display = 'block' }
 }
 
-const ah = () => ({ 'Authorization': 'Bearer ' + adminToken, 'Content-Type': 'application/json' })
+function showMain() {
+  document.getElementById('loginSection').style.display = 'none'
+  document.getElementById('mainSection').style.display = 'block'
+  loadAll()
+}
+
+function ah() { return { 'Authorization':'Bearer '+adminToken, 'Content-Type':'application/json' } }
+
+async function loadAll() {
+  await loadCharacter()
+  loadStats()
+}
 
 async function loadCharacter() {
-  const r = await fetch('/api/admin/character', { headers: ah() })
-  const c = await r.json()
-  document.getElementById('charName').value = c.name || ''
-  document.getElementById('charIntro').value = c.intro || ''
-  document.getElementById('charImage').value = c.profileImageUrl || ''
-  document.getElementById('charOpening').value = c.openingMessage || ''
-  document.getElementById('charPlayGuide').value = c.playGuide || ''
-  document.getElementById('charPrompt').value = c.characterPrompt || ''
-  document.getElementById('charDetail').value = c.characterDetail || ''
-  document.getElementById('charGenre').value = c.genre || ''
-  document.getElementById('charHashtags').value = (c.hashtags || []).join(', ')
-  document.getElementById('charLore').value = c.lore || ''
-  document.getElementById('charSpecs').value = JSON.stringify(c.specs || [], null, 2)
+  var r = await fetch('/api/admin/character', { headers:ah() })
+  if (!r.ok) { sessionStorage.removeItem('adminToken'); location.reload(); return }
+  charData = await r.json()
+  document.getElementById('charName').value = charData.name || ''
+  document.getElementById('charIntro').value = charData.intro || ''
+  document.getElementById('charImage').value = charData.profileImageUrl || ''
+  document.getElementById('charOpening').value = charData.openingMessage || ''
+  document.getElementById('charPlayGuide').value = charData.playGuide || ''
+  document.getElementById('charPrompt').value = charData.characterPrompt || ''
+  document.getElementById('charDetail').value = charData.characterDetail || ''
+  document.getElementById('charGenre').value = charData.genre || 'fantasy'
+  document.getElementById('charHashtags').value = (charData.hashtags || []).join(', ')
+  document.getElementById('charLore').value = charData.lore || ''
+  previewProfile()
+  renderSpecs(charData.specs || [])
+  renderSituationImages(charData.situationImages || [])
 }
 
-function toast(msg) {
-  const t = document.getElementById('toast')
-  t.textContent = msg; t.style.display = 'block'
-  setTimeout(() => t.style.display = 'none', 2000)
+async function loadStats() {
+  try {
+    var r = await fetch('/api/admin/stats', { headers:ah() })
+    var d = await r.json()
+    document.getElementById('statMembers').textContent = d.members
+    document.getElementById('statGuests').textContent = d.guests
+    document.getElementById('statSessions').textContent = d.sessions
+  } catch(e) {}
+  var sr = await fetch('/api/status')
+  var sd = await sr.json()
+  document.getElementById('sysInfo').innerHTML =
+    '<b>API 상태:</b> ' + (sd.api === 'configured' ? '<span style="color:var(--ok)">✅ 연결됨</span>' : '<span style="color:var(--warn)">⚠️ 미설정</span>') + '<br>' +
+    '<b>캐릭터:</b> ' + (charData.name || '-') + '<br>' +
+    '<b>장르:</b> ' + (charData.genre || '-')
 }
 
+function previewProfile() {
+  var url = document.getElementById('charImage').value
+  var wrap = document.getElementById('profilePreviewWrap')
+  if (url) {
+    wrap.innerHTML = '<img class="profile-preview" src="'+url+'" alt="Profile" onerror="this.style.display=\\'none\\'">'
+  } else {
+    wrap.innerHTML = '<div style="width:80px;height:80px;border-radius:50%;background:var(--surface3);display:inline-flex;align-items:center;justify-content:center;font-size:36px;margin-bottom:12px">🗡</div>'
+  }
+}
+
+// Specs editor
+function renderSpecs(specs) {
+  var html = ''
+  for (var i = 0; i < specs.length && i < 6; i++) {
+    html += '<div style="display:flex;gap:8px;margin-bottom:8px"><input class="admin-input spec-label" value="'+esc(specs[i].label)+'" placeholder="라벨" style="width:35%"><input class="admin-input spec-value" value="'+esc(specs[i].value)+'" placeholder="값" style="width:55%"><button class="btn btn-danger btn-sm" onclick="this.parentElement.remove()" style="width:10%"><i class="fas fa-times"></i></button></div>'
+  }
+  document.getElementById('specsEditor').innerHTML = html
+}
+
+function addSpecRow() {
+  var rows = document.querySelectorAll('#specsEditor > div')
+  if (rows.length >= 6) { toast('최대 6개까지만 가능합니다'); return }
+  var div = document.createElement('div')
+  div.style.cssText = 'display:flex;gap:8px;margin-bottom:8px'
+  div.innerHTML = '<input class="admin-input spec-label" placeholder="라벨" style="width:35%"><input class="admin-input spec-value" placeholder="값" style="width:55%"><button class="btn btn-danger btn-sm" onclick="this.parentElement.remove()" style="width:10%"><i class="fas fa-times"></i></button>'
+  document.getElementById('specsEditor').appendChild(div)
+}
+
+function getSpecs() {
+  var specs = []
+  var labels = document.querySelectorAll('.spec-label')
+  var values = document.querySelectorAll('.spec-value')
+  for (var i = 0; i < labels.length; i++) {
+    if (labels[i].value.trim()) specs.push({ label: labels[i].value.trim(), value: values[i].value.trim() })
+  }
+  return specs
+}
+
+// Situation Images
+function renderSituationImages(images) {
+  var list = document.getElementById('siList')
+  if (!images || images.length === 0) {
+    list.innerHTML = '<div style="font-size:13px;color:var(--muted);padding:8px 0">등록된 상황 이미지가 없습니다</div>'
+    return
+  }
+  var html = ''
+  for (var i = 0; i < images.length; i++) {
+    var si = images[i]
+    html += '<div class="si-item"><img class="si-thumb" src="'+esc(si.imageUrl)+'" alt="" onerror="this.src=\\'\\'"><div class="si-info"><div class="si-trigger">🎯 '+esc(si.trigger)+'</div><div class="si-desc">'+esc(si.description || si.imageUrl)+'</div></div><div class="si-actions"><button class="btn btn-danger btn-sm" onclick="deleteSI(\\''+si.id+'\\')"><i class="fas fa-trash"></i></button></div></div>'
+  }
+  list.innerHTML = html
+}
+
+async function addSituationImage() {
+  var trigger = document.getElementById('siTrigger').value.trim()
+  var imageUrl = document.getElementById('siImageUrl').value.trim()
+  var desc = document.getElementById('siDesc').value.trim()
+  if (!trigger || !imageUrl) { toast('트리거와 이미지 URL은 필수입니다'); return }
+  await fetch('/api/admin/character/situation', { method:'POST', headers:ah(), body:JSON.stringify({trigger:trigger,imageUrl:imageUrl,description:desc}) })
+  document.getElementById('siTrigger').value = ''
+  document.getElementById('siImageUrl').value = ''
+  document.getElementById('siDesc').value = ''
+  await loadCharacter()
+  toast('✅ 상황 이미지 등록됨')
+}
+
+async function deleteSI(id) {
+  if (!confirm('삭제할까요?')) return
+  await fetch('/api/admin/character/situation/'+id, { method:'DELETE', headers:ah() })
+  await loadCharacter()
+  toast('✅ 삭제됨')
+}
+
+// Save functions
 async function saveKeys() {
-  await fetch('/api/admin/keys', { method: 'POST', headers: ah(), body: JSON.stringify({ openaiApiKey: document.getElementById('apiKey').value, openaiBaseUrl: document.getElementById('apiBaseUrl').value }) })
+  await fetch('/api/admin/keys', { method:'POST', headers:ah(), body:JSON.stringify({openaiApiKey:document.getElementById('apiKey').value,openaiBaseUrl:document.getElementById('apiBaseUrl').value}) })
+  loadStats()
   toast('✅ API 키 저장됨')
 }
 
 async function saveBasic() {
-  await fetch('/api/admin/character/update', { method: 'POST', headers: ah(), body: JSON.stringify({ name: document.getElementById('charName').value, intro: document.getElementById('charIntro').value, profileImageUrl: document.getElementById('charImage').value }) })
+  await fetch('/api/admin/character/update', { method:'POST', headers:ah(), body:JSON.stringify({name:document.getElementById('charName').value,intro:document.getElementById('charIntro').value,profileImageUrl:document.getElementById('charImage').value}) })
   toast('✅ 기본 정보 저장됨')
 }
 
 async function saveOpening() {
-  await fetch('/api/admin/character/update', { method: 'POST', headers: ah(), body: JSON.stringify({ openingMessage: document.getElementById('charOpening').value, playGuide: document.getElementById('charPlayGuide').value }) })
+  await fetch('/api/admin/character/update', { method:'POST', headers:ah(), body:JSON.stringify({openingMessage:document.getElementById('charOpening').value,playGuide:document.getElementById('charPlayGuide').value}) })
   toast('✅ 오프닝 저장됨')
 }
 
 async function savePrompt() {
-  await fetch('/api/admin/character/update', { method: 'POST', headers: ah(), body: JSON.stringify({ characterPrompt: document.getElementById('charPrompt').value }) })
+  await fetch('/api/admin/character/update', { method:'POST', headers:ah(), body:JSON.stringify({characterPrompt:document.getElementById('charPrompt').value}) })
   toast('✅ 프롬프트 저장됨')
 }
 
 async function saveDetail() {
-  const hashtags = document.getElementById('charHashtags').value.split(',').map(s => s.trim()).filter(Boolean)
-  await fetch('/api/admin/character/update', { method: 'POST', headers: ah(), body: JSON.stringify({ characterDetail: document.getElementById('charDetail').value, genre: document.getElementById('charGenre').value, hashtags }) })
+  var hashtags = document.getElementById('charHashtags').value.split(',').map(function(s){return s.trim()}).filter(Boolean)
+  await fetch('/api/admin/character/update', { method:'POST', headers:ah(), body:JSON.stringify({characterDetail:document.getElementById('charDetail').value,genre:document.getElementById('charGenre').value,hashtags:hashtags}) })
   toast('✅ 상세 저장됨')
 }
 
 async function saveLore() {
-  let specs = []
-  try { specs = JSON.parse(document.getElementById('charSpecs').value) } catch {}
-  await fetch('/api/admin/character/update', { method: 'POST', headers: ah(), body: JSON.stringify({ lore: document.getElementById('charLore').value, specs }) })
-  toast('✅ 세계관 저장됨')
+  await fetch('/api/admin/character/update', { method:'POST', headers:ah(), body:JSON.stringify({lore:document.getElementById('charLore').value,specs:getSpecs()}) })
+  toast('✅ 세계관 & 스펙 저장됨')
 }
 
 async function resetSessions() {
-  if (!confirm('정말 전체 세션을 초기화할까요?')) return
-  await fetch('/api/admin/reset-sessions', { method: 'POST', headers: ah() })
+  if (!confirm('정말 전체 세션을 초기화할까요? 이 작업은 되돌릴 수 없습니다.')) return
+  await fetch('/api/admin/reset-sessions', { method:'POST', headers:ah() })
+  loadStats()
   toast('✅ 전체 세션 초기화됨')
 }
+
+// Navigation
+function showPanel(id, btn) {
+  document.querySelectorAll('.panel').forEach(function(p){p.classList.remove('active')})
+  document.querySelectorAll('.nav-item').forEach(function(n){n.classList.remove('active')})
+  var panel = document.getElementById('panel-'+id)
+  if (panel) panel.classList.add('active')
+  if (btn) btn.classList.add('active')
+  var titles = {dashboard:'통계 요약',step1:'기본 정보',step2:'오프닝 설정',step3:'캐릭터 프롬프트',step4:'상황 이미지',step5:'캐릭터 상세',step6:'세계관 & 스펙',apikeys:'API 키 관리',danger:'위험 구역'}
+  document.getElementById('mobileTitle').textContent = titles[id] || ''
+  closeSidebar()
+}
+
+function openSidebar() {
+  document.getElementById('sidebar').classList.add('open')
+  document.getElementById('sidebarOverlay').classList.add('show')
+}
+function closeSidebar() {
+  document.getElementById('sidebar').classList.remove('open')
+  document.getElementById('sidebarOverlay').classList.remove('show')
+}
+
+// Helpers
+function toast(msg) {
+  var t = document.getElementById('toast')
+  t.textContent = msg; t.style.display = 'block'
+  setTimeout(function(){t.style.display='none'}, 2500)
+}
+function esc(s) { var d = document.createElement('div'); d.textContent = s||''; return d.innerHTML }
 </script>
 </body>
 </html>`
