@@ -863,12 +863,22 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
 .section-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px;margin-bottom:16px}
 .section-title{font-size:13px;color:var(--accent2);font-weight:600;margin-bottom:12px;text-transform:uppercase;letter-spacing:1px}
 .section-text{font-size:14px;line-height:1.7;color:var(--text);opacity:.85}
-.video-carousel{display:flex;flex-direction:column;gap:14px}
-.video-card{border-radius:12px;overflow:hidden;background:var(--surface2);border:1px solid var(--border)}
-.video-card video{width:100%;display:block;max-height:260px;object-fit:cover;background:#000}
-.video-card-info{padding:10px 14px}
-.video-card-title{font-size:13px;font-weight:600;color:var(--text);margin-bottom:2px}
-.video-card-desc{font-size:11px;color:var(--muted)}
+.video-carousel{position:relative;overflow:hidden;border-radius:14px}
+.video-track{display:flex;transition:transform .35s cubic-bezier(.4,0,.2,1);will-change:transform}
+.video-slide{min-width:100%;width:100%}
+.video-card{border-radius:14px;overflow:hidden;background:var(--surface2);border:1px solid var(--border)}
+.video-card video{width:100%;display:block;aspect-ratio:9/16;object-fit:contain;background:#000;border-radius:14px 14px 0 0}
+.video-card-info{padding:12px 16px}
+.video-card-title{font-size:14px;font-weight:700;color:var(--text);margin-bottom:6px}
+.video-card-desc{font-size:12px;color:var(--muted);line-height:1.6;white-space:pre-wrap}
+.video-indicators{display:flex;justify-content:center;gap:6px;padding:14px 0 4px}
+.video-dot{width:8px;height:8px;border-radius:50%;background:var(--surface3);border:1px solid var(--border);transition:all .25s;cursor:pointer}
+.video-dot.active{background:var(--accent);border-color:var(--accent);width:22px;border-radius:4px}
+.video-nav{position:absolute;top:40%;transform:translateY(-50%);width:32px;height:32px;border-radius:50%;background:rgba(0,0,0,.45);color:#fff;border:none;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;z-index:5;backdrop-filter:blur(4px);opacity:0;transition:opacity .2s}
+.video-carousel:hover .video-nav{opacity:1}
+.video-nav.prev{left:8px}
+.video-nav.next{right:8px}
+.video-counter{position:absolute;top:12px;right:12px;background:rgba(0,0,0,.55);color:#fff;font-size:11px;font-weight:600;padding:3px 10px;border-radius:12px;z-index:5;backdrop-filter:blur(4px);letter-spacing:.5px}
 .spec-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .spec-item{background:var(--surface2);border-radius:12px;padding:12px;text-align:center}
 .spec-label{font-size:11px;color:var(--muted);margin-bottom:4px}
@@ -987,6 +997,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
       <div class="section-card" id="videoSection" style="display:none">
         <div class="section-title"><i class="fas fa-film"></i> Videos</div>
         <div class="video-carousel" id="videoCarousel"></div>
+        <div class="video-indicators" id="videoIndicators"></div>
       </div>
 
       <!-- Specs Section -->
@@ -1215,15 +1226,45 @@ function renderLanding() {
   // Videos
   const videoSection = document.getElementById('videoSection')
   const videoCarousel = document.getElementById('videoCarousel')
+  const videoIndicators = document.getElementById('videoIndicators')
   if (c.videos && c.videos.length > 0) {
     videoSection.style.display = ''
-    videoCarousel.innerHTML = c.videos.map(function(v) {
+    const count = c.videos.length
+    // Build track with slides
+    let trackHTML = '<div class="video-track" id="videoTrack">'
+    trackHTML += c.videos.map(function(v, i) {
       const poster = v.thumbnailUrl ? ' poster="' + v.thumbnailUrl + '"' : ''
-      return '<div class="video-card"><video controls playsinline preload="metadata"' + poster + '><source src="' + v.videoUrl + '"></video>' + (v.title || v.description ? '<div class="video-card-info">' + (v.title ? '<div class="video-card-title">' + v.title + '</div>' : '') + (v.description ? '<div class="video-card-desc">' + v.description + '</div>' : '') + '</div>' : '') + '</div>'
+      const autoAttr = i === 0 ? ' autoplay muted' : ''
+      let info = '<div class="video-card-info">'
+      info += '<div class="video-card-title">' + (v.title || '동영상 클립') + '</div>'
+      info += '<div class="video-card-desc">' + (v.description || '') + '</div>'
+      info += '</div>'
+      return '<div class="video-slide"><div class="video-card"><video controls playsinline preload="metadata" loop' + poster + autoAttr + '><source src="' + v.videoUrl + '"></video>' + info + '</div></div>'
     }).join('')
+    trackHTML += '</div>'
+    if (count > 1) {
+      trackHTML += '<div class="video-counter" id="videoCounter">1 / ' + count + '</div>'
+      trackHTML += '<button class="video-nav prev" onclick="slideVideo(-1)"><i class="fas fa-chevron-left"></i></button>'
+      trackHTML += '<button class="video-nav next" onclick="slideVideo(1)"><i class="fas fa-chevron-right"></i></button>'
+    }
+    videoCarousel.innerHTML = trackHTML
+    // Indicators
+    if (count > 1) {
+      videoIndicators.style.display = 'flex'
+      videoIndicators.innerHTML = c.videos.map(function(_, i) {
+        return '<div class="video-dot' + (i === 0 ? ' active' : '') + '" onclick="goToVideo(' + i + ')"></div>'
+      }).join('')
+    } else {
+      videoIndicators.style.display = 'none'
+      videoIndicators.innerHTML = ''
+    }
+    window._vidIdx = 0
+    window._vidCount = count
+    initVideoSwipe()
   } else {
     videoSection.style.display = 'none'
     videoCarousel.innerHTML = ''
+    videoIndicators.innerHTML = ''
   }
   
   // Specs
@@ -1263,6 +1304,55 @@ function updateUI() {
       document.getElementById('continueBtn').style.display = ''
     }
   }
+}
+
+// ─── Video Carousel ───
+function slideVideo(dir) {
+  const idx = (window._vidIdx || 0) + dir
+  if (idx < 0 || idx >= (window._vidCount || 1)) return
+  goToVideo(idx)
+}
+
+function goToVideo(idx) {
+  const track = document.getElementById('videoTrack')
+  if (!track) return
+  window._vidIdx = idx
+  track.style.transform = 'translateX(-' + (idx * 100) + '%)'
+  // Update indicators
+  document.querySelectorAll('.video-dot').forEach(function(d, i) {
+    d.classList.toggle('active', i === idx)
+  })
+  // Update counter
+  const counter = document.getElementById('videoCounter')
+  if (counter) counter.textContent = (idx + 1) + ' / ' + window._vidCount
+  // Pause all videos, play current
+  var allVids = document.querySelectorAll('#videoTrack video')
+  allVids.forEach(function(v, i) {
+    v.pause()
+    if (i === idx) { v.currentTime = 0; v.muted = true; v.play().catch(function(){}) }
+  })
+}
+
+function initVideoSwipe() {
+  var carousel = document.querySelector('.video-carousel')
+  if (!carousel) return
+  var startX = 0, startY = 0, dragging = false
+  carousel.addEventListener('touchstart', function(e) {
+    startX = e.touches[0].clientX
+    startY = e.touches[0].clientY
+    dragging = true
+  }, { passive: true })
+  carousel.addEventListener('touchend', function(e) {
+    if (!dragging) return
+    dragging = false
+    var diffX = e.changedTouches[0].clientX - startX
+    var diffY = e.changedTouches[0].clientY - startY
+    // Only swipe if horizontal movement is dominant
+    if (Math.abs(diffX) > 40 && Math.abs(diffX) > Math.abs(diffY)) {
+      if (diffX < 0) slideVideo(1)
+      else slideVideo(-1)
+    }
+  }, { passive: true })
 }
 
 // ─── Chat Functions ───
