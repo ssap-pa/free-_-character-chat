@@ -853,8 +853,13 @@ app.post('/api/payment/confirm', authMiddleware, async (c) => {
 // POST /api/admin/payment - Save payment settings
 app.post('/api/admin/payment', adminAuth, async (c) => {
   const { tossClientKey, tossSecretKey, plans } = await c.req.json()
-  if (tossClientKey !== undefined) await c.env.KV.put('toss_client_key', tossClientKey)
-  if (tossSecretKey !== undefined) await c.env.KV.put('toss_secret_key', tossSecretKey)
+  // Trim whitespace from keys to prevent auth errors
+  if (tossClientKey !== undefined && tossClientKey.trim()) {
+    await c.env.KV.put('toss_client_key', tossClientKey.trim())
+  }
+  if (tossSecretKey !== undefined && tossSecretKey.trim()) {
+    await c.env.KV.put('toss_secret_key', tossSecretKey.trim())
+  }
   if (plans) await c.env.KV.put('payment_plans', JSON.stringify(plans))
   return c.json({ success: true })
 })
@@ -1977,7 +1982,7 @@ async function processPayment() {
   statusEl.textContent = '결제 준비 중...'
   
   try {
-    // 1) Prepare order
+    // 1) Prepare order on server
     const prepResp = await fetch('/api/payment/prepare', {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + state.token, 'Content-Type': 'application/json' },
@@ -1986,38 +1991,43 @@ async function processPayment() {
     const prepData = await prepResp.json()
     if (!prepResp.ok) { statusEl.textContent = '❌ ' + prepData.error; return }
     
-    // 2) Load Toss Payments SDK dynamically
+    // 2) Load Toss Payments SDK v2
     if (!window.TossPayments) {
       await new Promise(function(resolve, reject) {
         const script = document.createElement('script')
-        script.src = 'https://js.tosspayments.com/v1/payment'
+        script.src = 'https://js.tosspayments.com/v2/standard'
         script.onload = resolve
-        script.onerror = reject
+        script.onerror = function() { reject(new Error('토스 SDK 로드 실패')) }
         document.head.appendChild(script)
       })
     }
     
-    // 3) Open Toss Payment widget
+    // 3) Initialize and request payment
     statusEl.textContent = '토스 결제창 열기...'
-    const toss = TossPayments(paymentConfig.clientKey)
+    const clientKey = paymentConfig.clientKey.trim()
     
-    toss.requestPayment('카드', {
-      amount: prepData.amount,
+    const toss = TossPayments(clientKey)
+    const payment = toss.payment({ customerKey: state.userId || 'guest_' + Date.now() })
+    
+    await payment.requestPayment({
+      method: 'CARD',
+      amount: { currency: 'KRW', value: prepData.amount },
       orderId: prepData.orderId,
       orderName: prepData.orderName,
       customerName: state.nickname || 'User',
+      customerEmail: '',
       successUrl: location.origin + '/payment/success',
       failUrl: location.origin + '/payment/fail'
-    }).catch(function(err) {
-      if (err.code === 'USER_CANCEL') {
-        statusEl.textContent = '결제가 취소되었습니다.'
-      } else {
-        statusEl.textContent = '❌ ' + (err.message || '결제 오류')
-      }
     })
     
   } catch(e) {
-    statusEl.textContent = '❌ 결제 처리 중 오류가 발생했습니다.'
+    if (e && e.code === 'USER_CANCEL') {
+      statusEl.textContent = '결제가 취소되었습니다.'
+    } else if (e && e.code === 'INVALID_CLIENT_KEY') {
+      statusEl.textContent = '❌ 클라이언트 키가 유효하지 않습니다. 관리자에게 문의하세요.'
+    } else {
+      statusEl.textContent = '❌ ' + (e.message || '결제 처리 중 오류가 발생했습니다.')
+    }
   }
 }
 
@@ -2886,6 +2896,26 @@ async function savePayment() {
   var clientKey = document.getElementById('tossClientKey').value.trim()
   var secretKey = document.getElementById('tossSecretKey').value.trim()
   var plans = getPlans()
+  
+  // Validate key format
+  if (clientKey && !clientKey.startsWith('test_ck_') && !clientKey.startsWith('live_ck_')) {
+    toast('⚠️ Client Key는 test_ck_ 또는 live_ck_로 시작해야 합니다')
+    return
+  }
+  if (secretKey && !secretKey.startsWith('test_sk_') && !secretKey.startsWith('live_sk_')) {
+    toast('⚠️ Secret Key는 test_sk_ 또는 live_sk_로 시작해야 합니다')
+    return
+  }
+  // Check for test/live mismatch
+  if (clientKey && secretKey) {
+    var clientIsTest = clientKey.startsWith('test_')
+    var secretIsTest = secretKey.startsWith('test_')
+    if (clientIsTest !== secretIsTest) {
+      toast('⚠️ Client Key와 Secret Key가 테스트/라이브 환경이 다릅니다. 같은 환경의 키를 사용하세요.')
+      return
+    }
+  }
+  
   var body = { tossClientKey: clientKey, plans: plans }
   if (secretKey) body.tossSecretKey = secretKey
   await fetch('/api/admin/payment', { method:'POST', headers:ah(), body:JSON.stringify(body) })
