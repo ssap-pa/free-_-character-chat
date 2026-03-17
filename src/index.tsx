@@ -1230,6 +1230,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
       <button class="menu-btn" onclick="toggleMenu()"><i class="fas fa-ellipsis-v"></i></button>
       <div class="menu-dropdown" id="menuDropdown">
         <div class="menu-item" onclick="resetChat()"><i class="fas fa-redo"></i> 대화 초기화</div>
+        <div class="menu-item" onclick="showPaymentModal();toggleMenu()"><i class="fas fa-gem"></i> 토큰 충전</div>
         <div class="menu-item" id="menuLoginItem" onclick="showModal('loginModal');toggleMenu()"><i class="fas fa-sign-in-alt"></i> 로그인</div>
         <div class="menu-item danger" id="menuLogoutItem" style="display:none" onclick="doLogout()"><i class="fas fa-sign-out-alt"></i> 로그아웃</div>
       </div>
