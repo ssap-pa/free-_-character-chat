@@ -14,6 +14,10 @@ type Bindings = {
   MEMBER_TOKEN_LIMIT?: string
   TOSS_CLIENT_KEY?: string
   TOSS_SECRET_KEY?: string
+  GOOGLE_CLIENT_ID?: string
+  GOOGLE_CLIENT_SECRET?: string
+  KAKAO_CLIENT_ID?: string
+  KAKAO_CLIENT_SECRET?: string
 }
 
 type Variables = {
@@ -660,7 +664,8 @@ const adminAuth = async (c: any, next: any) => {
 // POST /api/admin/login
 app.post('/api/admin/login', async (c) => {
   const { password } = await c.req.json()
-  const adminPw = c.env.ADMIN_PASSWORD || 'admin1234'
+  const storedPw = await c.env.KV.get('admin_password')
+  const adminPw = storedPw || c.env.ADMIN_PASSWORD || 'admin1234'
   if (password !== adminPw) return c.json({ error: '비밀번호가 올바르지 않습니다.' }, 401)
   
   const secret = c.env.JWT_SECRET || 'default-secret-change-me'
@@ -697,6 +702,216 @@ app.post('/api/admin/reset-sessions', adminAuth, async (c) => {
   await c.env.DB.prepare('DELETE FROM sessions').run()
   await c.env.DB.prepare('UPDATE users SET token_used = 0').run()
   return c.json({ success: true })
+})
+
+// POST /api/admin/change-password - Change admin password
+app.post('/api/admin/change-password', adminAuth, async (c) => {
+  const { currentPassword, newPassword } = await c.req.json()
+  if (!currentPassword || !newPassword) return c.json({ error: '현재 비밀번호와 새 비밀번호를 입력하세요.' }, 400)
+  if (newPassword.length < 6) return c.json({ error: '새 비밀번호는 6자 이상이어야 합니다.' }, 400)
+
+  // Check current password
+  const storedPw = await c.env.KV.get('admin_password') || c.env.ADMIN_PASSWORD || 'admin1234'
+  if (currentPassword !== storedPw) return c.json({ error: '현재 비밀번호가 올바르지 않습니다.' }, 401)
+
+  // Save new password to KV
+  await c.env.KV.put('admin_password', newPassword)
+  return c.json({ success: true })
+})
+
+// Update admin login to check KV-stored password first
+// (The existing login endpoint at line ~661 needs updating)
+
+// ═══  SOCIAL LOGIN (Google / Kakao)  ═══
+
+// GET /api/auth/google - Redirect to Google OAuth
+app.get('/api/auth/google', async (c) => {
+  const clientId = await c.env.KV.get('google_client_id') || c.env.GOOGLE_CLIENT_ID || ''
+  if (!clientId) return c.json({ error: 'Google OAuth가 설정되지 않았습니다.' }, 400)
+
+  const redirectUri = new URL('/api/auth/google/callback', c.req.url).toString()
+  const guestToken = c.req.query('guestToken') || ''
+  
+  const state = btoa(JSON.stringify({ guestToken }))
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    scope: 'openid email profile',
+    state,
+    access_type: 'offline',
+    prompt: 'consent'
+  })
+
+  return c.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params}`)
+})
+
+// GET /api/auth/google/callback
+app.get('/api/auth/google/callback', async (c) => {
+  const code = c.req.query('code')
+  const stateParam = c.req.query('state')
+  if (!code) return c.redirect('/?error=google_auth_failed')
+
+  let guestToken = ''
+  try { const s = JSON.parse(atob(stateParam || '')); guestToken = s.guestToken || '' } catch {}
+
+  const clientId = await c.env.KV.get('google_client_id') || c.env.GOOGLE_CLIENT_ID || ''
+  const clientSecret = await c.env.KV.get('google_client_secret') || c.env.GOOGLE_CLIENT_SECRET || ''
+  const redirectUri = new URL('/api/auth/google/callback', c.req.url).toString()
+
+  // Exchange code for tokens
+  const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ code, client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri, grant_type: 'authorization_code' })
+  })
+  const tokenData: any = await tokenResp.json()
+  if (!tokenData.access_token) return c.redirect('/?error=google_token_failed')
+
+  // Get user info
+  const userResp = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+    headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
+  })
+  const userInfo: any = await userResp.json()
+  const email = userInfo.email
+  const name = userInfo.name || email.split('@')[0]
+
+  return handleSocialLogin(c, email, name, 'google', guestToken)
+})
+
+// GET /api/auth/kakao - Redirect to Kakao OAuth
+app.get('/api/auth/kakao', async (c) => {
+  const clientId = await c.env.KV.get('kakao_client_id') || c.env.KAKAO_CLIENT_ID || ''
+  if (!clientId) return c.json({ error: 'Kakao OAuth가 설정되지 않았습니다.' }, 400)
+
+  const redirectUri = new URL('/api/auth/kakao/callback', c.req.url).toString()
+  const guestToken = c.req.query('guestToken') || ''
+
+  const state = btoa(JSON.stringify({ guestToken }))
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    state,
+    scope: 'profile_nickname account_email'
+  })
+
+  return c.redirect(`https://kauth.kakao.com/oauth/authorize?${params}`)
+})
+
+// GET /api/auth/kakao/callback
+app.get('/api/auth/kakao/callback', async (c) => {
+  const code = c.req.query('code')
+  const stateParam = c.req.query('state')
+  if (!code) return c.redirect('/?error=kakao_auth_failed')
+
+  let guestToken = ''
+  try { const s = JSON.parse(atob(stateParam || '')); guestToken = s.guestToken || '' } catch {}
+
+  const clientId = await c.env.KV.get('kakao_client_id') || c.env.KAKAO_CLIENT_ID || ''
+  const clientSecret = await c.env.KV.get('kakao_client_secret') || c.env.KAKAO_CLIENT_SECRET || ''
+  const redirectUri = new URL('/api/auth/kakao/callback', c.req.url).toString()
+
+  // Exchange code for tokens
+  const tokenResp = await fetch('https://kauth.kakao.com/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ code, client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri, grant_type: 'authorization_code' })
+  })
+  const tokenData: any = await tokenResp.json()
+  if (!tokenData.access_token) return c.redirect('/?error=kakao_token_failed')
+
+  // Get user info
+  const userResp = await fetch('https://kapi.kakao.com/v2/user/me', {
+    headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
+  })
+  const userInfo: any = await userResp.json()
+  const email = userInfo.kakao_account?.email || `kakao_${userInfo.id}@kakao.user`
+  const name = userInfo.kakao_account?.profile?.nickname || userInfo.properties?.nickname || `User${userInfo.id}`
+
+  return handleSocialLogin(c, email, name, 'kakao', guestToken)
+})
+
+// Social login handler (shared between Google and Kakao)
+async function handleSocialLogin(c: any, email: string, name: string, provider: string, guestToken: string) {
+  const secret = c.env.JWT_SECRET || 'default-secret-change-me'
+  const memberLimit = parseInt(c.env.MEMBER_TOKEN_LIMIT || '100')
+
+  // Check if user exists
+  let user: any = await c.env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email).first()
+
+  if (!user) {
+    // Create new user from social login
+    const userId = generateId('user')
+    await c.env.DB.prepare(
+      `INSERT INTO users (id, email, password_hash, nickname, char_name, genres, token_used, token_limit, is_guest) VALUES (?, ?, ?, ?, ?, ?, 0, ?, 0)`
+    ).bind(userId, email, `${provider}_oauth`, name, '자기', '[]', memberLimit).run()
+
+    // Create session
+    await c.env.DB.prepare('INSERT INTO sessions (user_id, history) VALUES (?, \'[]\')').bind(userId).run()
+
+    // Transfer guest history if available
+    if (guestToken) {
+      try {
+        const guestPayload = await verifyJWT(guestToken, secret)
+        if (guestPayload) {
+          const guestSession = await c.env.DB.prepare('SELECT history FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT 1').bind(guestPayload.userId).first()
+          if (guestSession) {
+            await c.env.DB.prepare('UPDATE sessions SET history = ? WHERE user_id = ?').bind(guestSession.history, userId).run()
+          }
+          const guestUser = await c.env.DB.prepare('SELECT token_used FROM users WHERE id = ?').bind(guestPayload.userId).first()
+          if (guestUser) {
+            await c.env.DB.prepare('UPDATE users SET token_used = ? WHERE id = ?').bind((guestUser as any).token_used || 0, userId).run()
+          }
+        }
+      } catch {}
+    }
+
+    user = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first()
+  }
+
+  const token = await createJWT({ userId: user.id, isGuest: false }, secret, 30 * 24 * 3600)
+
+  // Redirect to main page with auth data in URL hash
+  const authData = encodeURIComponent(JSON.stringify({
+    token, userId: user.id, nickname: user.nickname, charName: user.char_name,
+    tokenLimit: user.token_limit, tokenUsed: user.token_used, isGuest: false, provider
+  }))
+
+  return c.redirect(`/?socialAuth=${authData}`)
+}
+
+// GET /api/auth/config - Get social login availability
+app.get('/api/auth/config', async (c) => {
+  const googleId = await c.env.KV.get('google_client_id') || c.env.GOOGLE_CLIENT_ID || ''
+  const kakaoId = await c.env.KV.get('kakao_client_id') || c.env.KAKAO_CLIENT_ID || ''
+  return c.json({
+    google: !!googleId,
+    kakao: !!kakaoId
+  })
+})
+
+// ═══  LEGAL PAGES  ═══
+
+// GET /terms - 이용약관
+app.get('/terms', async (c) => {
+  const config = await getCharacterConfig(c.env.KV)
+  const serviceName = config.name + ' — AI Character Chat'
+  return c.html(legalPageHTML('이용약관', serviceName, termsContent(serviceName)))
+})
+
+// GET /privacy - 개인정보처리방침
+app.get('/privacy', async (c) => {
+  const config = await getCharacterConfig(c.env.KV)
+  const serviceName = config.name + ' — AI Character Chat'
+  return c.html(legalPageHTML('개인정보처리방침', serviceName, privacyContent(serviceName)))
+})
+
+// GET /refund - 취소/환불 정책
+app.get('/refund', async (c) => {
+  const config = await getCharacterConfig(c.env.KV)
+  const serviceName = config.name + ' — AI Character Chat'
+  return c.html(legalPageHTML('취소 및 환불 정책', serviceName, refundContent(serviceName)))
 })
 
 // POST /api/admin/character/situation - Add situation image
@@ -876,6 +1091,30 @@ app.get('/api/admin/payment', adminAuth, async (c) => {
   return c.json({ tossClientKey: clientKey, tossSecretKeySet: !!secretKey, plans })
 })
 
+// POST /api/admin/social - Save social login settings
+app.post('/api/admin/social', adminAuth, async (c) => {
+  const { googleClientId, googleClientSecret, kakaoClientId, kakaoClientSecret } = await c.req.json()
+  if (googleClientId !== undefined) await c.env.KV.put('google_client_id', googleClientId.trim())
+  if (googleClientSecret !== undefined) await c.env.KV.put('google_client_secret', googleClientSecret.trim())
+  if (kakaoClientId !== undefined) await c.env.KV.put('kakao_client_id', kakaoClientId.trim())
+  if (kakaoClientSecret !== undefined) await c.env.KV.put('kakao_client_secret', kakaoClientSecret.trim())
+  return c.json({ success: true })
+})
+
+// GET /api/admin/social - Get social login settings
+app.get('/api/admin/social', adminAuth, async (c) => {
+  const googleClientId = await c.env.KV.get('google_client_id') || ''
+  const googleClientSecret = await c.env.KV.get('google_client_secret') || ''
+  const kakaoClientId = await c.env.KV.get('kakao_client_id') || ''
+  const kakaoClientSecret = await c.env.KV.get('kakao_client_secret') || ''
+  return c.json({
+    googleClientId,
+    googleClientSecretSet: !!googleClientSecret,
+    kakaoClientId,
+    kakaoClientSecretSet: !!kakaoClientSecret
+  })
+})
+
 // ═══  FILE UPLOAD API  ═══
 
 // POST /api/admin/upload - Upload file (image or video) to KV
@@ -1015,6 +1254,196 @@ app.get('/admin/', async (c) => {
 })
 
 // ─── MAIN HTML (inline for Cloudflare Workers) ───
+// ─── Legal Page Templates ───
+function legalPageHTML(title: string, serviceName: string, content: string): string {
+  return `<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title} — ${serviceName}</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a10;color:#e8e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',sans-serif;line-height:1.8}
+.container{max-width:720px;margin:0 auto;padding:40px 20px 80px}.back{display:inline-block;color:#a07de0;text-decoration:none;margin-bottom:24px;font-size:14px}
+h1{font-size:24px;font-weight:800;margin-bottom:8px;color:#c4a8ff}
+.updated{font-size:12px;color:#7777a0;margin-bottom:32px}
+h2{font-size:18px;font-weight:700;margin-top:32px;margin-bottom:12px;color:#a07de0}
+h3{font-size:15px;font-weight:600;margin-top:20px;margin-bottom:8px;color:#e8e8f0}
+p,li{font-size:14px;color:#c8c8d8;margin-bottom:8px}
+ul,ol{padding-left:20px;margin-bottom:12px}
+table{width:100%;border-collapse:collapse;margin:12px 0}th,td{border:1px solid #2a2a3a;padding:8px 12px;font-size:13px;text-align:left}
+th{background:#1c1c28;color:#a07de0}td{color:#c8c8d8}
+.highlight{background:#1c1c28;border:1px solid #2a2a3a;border-radius:12px;padding:16px;margin:12px 0}
+</style></head><body><div class="container"><a href="/" class="back">← 홈으로 돌아가기</a>
+<h1>${title}</h1><div class="updated">최종 수정일: ${new Date().toISOString().split('T')[0]}</div>
+${content}</div></body></html>`
+}
+
+function termsContent(serviceName: string): string {
+  return `
+<h2>제1조 (목적)</h2>
+<p>이 약관은 ${serviceName} (이하 "서비스")가 제공하는 AI 캐릭터 채팅 서비스의 이용과 관련하여 서비스와 이용자 사이의 권리, 의무 및 책임사항을 규정함을 목적으로 합니다.</p>
+
+<h2>제2조 (용어의 정의)</h2>
+<ul>
+<li><strong>"서비스"</strong>란 AI 캐릭터와의 대화를 제공하는 웹 기반 서비스를 의미합니다.</li>
+<li><strong>"이용자"</strong>란 이 약관에 따라 서비스를 이용하는 자를 말합니다.</li>
+<li><strong>"회원"</strong>이란 서비스에 가입하여 이메일/비밀번호 또는 소셜 로그인으로 계정을 보유한 이용자를 말합니다.</li>
+<li><strong>"토큰"</strong>이란 서비스 내 대화 가능 횟수를 의미하는 단위입니다.</li>
+<li><strong>"유료 서비스"</strong>란 토큰 충전 등 결제를 통해 이용하는 서비스를 의미합니다.</li>
+</ul>
+
+<h2>제3조 (약관의 효력 및 변경)</h2>
+<p>이 약관은 서비스 화면에 게시하여 공지함으로써 효력을 발생합니다. 서비스는 관련 법률에 위배되지 않는 범위 내에서 약관을 변경할 수 있으며, 변경 시 최소 7일 전 공지합니다.</p>
+
+<h2>제4조 (서비스의 제공 및 변경)</h2>
+<ul>
+<li>서비스는 AI 캐릭터와의 텍스트 기반 대화 서비스를 제공합니다.</li>
+<li>무료 이용자에게는 제한된 수의 대화 토큰이 제공됩니다.</li>
+<li>서비스 내용은 사전 고지 후 변경될 수 있습니다.</li>
+</ul>
+
+<h2>제5조 (이용계약의 체결)</h2>
+<p>이용계약은 이용자가 약관에 동의하고 회원가입 또는 게스트 이용을 시작함으로써 체결됩니다. 소셜 로그인(구글, 카카오)을 통한 가입도 동일한 효력을 가집니다.</p>
+
+<h2>제6조 (유료 서비스 및 결제)</h2>
+<ul>
+<li>유료 서비스의 가격은 서비스 내 결제 화면에 표시됩니다.</li>
+<li>결제는 토스 페이먼츠를 통해 처리됩니다.</li>
+<li>결제 완료 시 즉시 토큰이 충전되며 이용 가능합니다.</li>
+<li>결제에 관한 문의는 서비스 내 안내 또는 이메일을 통해 가능합니다.</li>
+</ul>
+
+<h2>제7조 (청약 철회 및 환불)</h2>
+<p>유료 서비스의 취소 및 환불에 관한 사항은 <a href="/refund" style="color:#a07de0">취소 및 환불 정책</a>에 따릅니다.</p>
+
+<h2>제8조 (이용자의 의무)</h2>
+<ul>
+<li>타인의 정보를 도용하여 서비스를 이용해서는 안 됩니다.</li>
+<li>서비스를 이용하여 불법적이거나 부적절한 행위를 해서는 안 됩니다.</li>
+<li>서비스의 정상적인 운영을 방해하는 행위를 해서는 안 됩니다.</li>
+</ul>
+
+<h2>제9조 (서비스의 중단)</h2>
+<p>서비스는 시스템 점검, 설비 장애, 천재지변 등의 사유로 일시적으로 중단될 수 있으며, 이 경우 사전에 공지합니다.</p>
+
+<h2>제10조 (면책 조항)</h2>
+<ul>
+<li>AI가 생성한 대화 내용은 창작물이며, 사실과 다를 수 있습니다.</li>
+<li>서비스는 AI 응답의 정확성, 적절성에 대해 보증하지 않습니다.</li>
+<li>이용자의 귀책 사유로 인한 손해에 대해 서비스는 책임을 지지 않습니다.</li>
+</ul>
+
+<h2>제11조 (분쟁 해결)</h2>
+<p>서비스와 이용자 간의 분쟁이 발생한 경우 양 당사자 간의 합의에 의해 해결합니다. 합의가 이루어지지 않을 경우 관할 법원에 소를 제기할 수 있습니다.</p>
+
+<div class="highlight"><p><strong>부칙:</strong> 이 약관은 공시한 날부터 시행합니다.</p></div>`
+}
+
+function privacyContent(serviceName: string): string {
+  return `
+<h2>1. 개인정보의 수집 및 이용 목적</h2>
+<p>${serviceName}(이하 "서비스")은 다음의 목적을 위하여 개인정보를 처리합니다.</p>
+<table><tr><th>목적</th><th>항목</th></tr>
+<tr><td>회원 가입 및 관리</td><td>이메일, 닉네임, 비밀번호(해시), 소셜 로그인 식별정보</td></tr>
+<tr><td>서비스 제공</td><td>대화 내역, 토큰 사용량</td></tr>
+<tr><td>유료 서비스 결제</td><td>결제 정보(토스 페이먼츠 처리, 서비스 자체 저장 안 함)</td></tr>
+</table>
+
+<h2>2. 수집하는 개인정보 항목</h2>
+<h3>필수 항목</h3>
+<ul>
+<li>이메일 주소 (회원가입 또는 소셜 로그인 시)</li>
+<li>닉네임</li>
+<li>비밀번호 (해시 처리하여 저장, 소셜 로그인 시 미수집)</li>
+</ul>
+<h3>자동 수집 항목</h3>
+<ul>
+<li>서비스 이용 기록 (대화 내역, 토큰 사용량)</li>
+<li>접속 로그 (접속 시간)</li>
+</ul>
+<h3>소셜 로그인 시 제3자 제공 정보</h3>
+<ul>
+<li>구글: 이메일, 이름, 프로필 사진 URL</li>
+<li>카카오: 이메일, 닉네임</li>
+</ul>
+
+<h2>3. 개인정보의 보유 및 이용 기간</h2>
+<ul>
+<li>회원 정보: 회원 탈퇴 시까지</li>
+<li>대화 내역: 세션 초기화 또는 회원 탈퇴 시까지</li>
+<li>결제 관련 기록: 전자상거래법에 따라 5년</li>
+</ul>
+
+<h2>4. 개인정보의 제3자 제공</h2>
+<p>서비스는 원칙적으로 이용자의 개인정보를 제3자에게 제공하지 않습니다. 다만 다음의 경우에는 예외로 합니다:</p>
+<ul>
+<li>이용자가 사전에 동의한 경우</li>
+<li>법령에 의해 요구되는 경우</li>
+<li>결제 처리를 위한 토스 페이먼츠 연동 (결제 정보만 전달)</li>
+</ul>
+
+<h2>5. 개인정보의 파기 절차 및 방법</h2>
+<p>보유 기간이 경과하거나 처리 목적이 달성된 개인정보는 지체 없이 파기합니다. 전자적 파일 형태의 정보는 복구할 수 없는 기술적 방법으로 삭제합니다.</p>
+
+<h2>6. 이용자의 권리</h2>
+<ul>
+<li>개인정보 열람, 정정, 삭제를 요청할 수 있습니다.</li>
+<li>회원 탈퇴를 통해 개인정보 삭제를 요청할 수 있습니다.</li>
+<li>대화 초기화를 통해 대화 내역을 삭제할 수 있습니다.</li>
+</ul>
+
+<h2>7. 개인정보 보호 조치</h2>
+<ul>
+<li>비밀번호는 PBKDF2 알고리즘으로 단방향 암호화하여 저장합니다.</li>
+<li>모든 통신은 HTTPS(SSL/TLS)로 암호화됩니다.</li>
+<li>Cloudflare의 보안 인프라를 활용하여 데이터를 보호합니다.</li>
+</ul>
+
+<h2>8. 개인정보 보호책임자</h2>
+<div class="highlight">
+<p>개인정보 관련 문의사항은 서비스 내 관리자에게 연락해 주시기 바랍니다.</p>
+</div>`
+}
+
+function refundContent(serviceName: string): string {
+  return `
+<h2>1. 환불 정책 개요</h2>
+<p>${serviceName}(이하 "서비스")의 유료 서비스(토큰 충전)에 대한 취소 및 환불 정책을 안내합니다.</p>
+
+<h2>2. 청약 철회 (구매 취소)</h2>
+<div class="highlight">
+<p><strong>결제 후 7일 이내</strong>, 충전된 토큰을 <strong>1회도 사용하지 않은 경우</strong> 전액 환불이 가능합니다.</p>
+</div>
+
+<h2>3. 환불이 불가능한 경우</h2>
+<ul>
+<li>충전된 토큰을 1회 이상 사용한 경우</li>
+<li>결제일로부터 7일이 경과한 경우</li>
+<li>이용자의 귀책 사유로 인해 서비스 이용이 제한된 경우</li>
+</ul>
+
+<h2>4. 부분 환불</h2>
+<p>토큰을 일부 사용한 경우, 사용한 토큰에 해당하는 금액을 제외하고 나머지 금액에 대해 환불을 요청할 수 있습니다. 부분 환불 금액은 다음과 같이 산정합니다:</p>
+<p><strong>환불 금액 = 결제 금액 - (사용한 토큰 수 × 토큰 단가)</strong></p>
+<p>단, 토큰 단가는 구매한 상품의 단위 가격을 기준으로 합니다.</p>
+
+<h2>5. 환불 절차</h2>
+<ol>
+<li>서비스 관리자에게 환불 요청 (이메일 또는 서비스 내 문의)</li>
+<li>환불 사유 및 결제 정보 확인</li>
+<li>환불 승인 후 원래 결제 수단으로 환불 처리 (영업일 기준 3~5일 소요)</li>
+</ol>
+
+<h2>6. 결제 수단별 환불 안내</h2>
+<table>
+<tr><th>결제 수단</th><th>환불 소요 기간</th></tr>
+<tr><td>신용카드</td><td>승인 취소 즉시 ~ 영업일 3일</td></tr>
+<tr><td>체크카드</td><td>영업일 3~5일</td></tr>
+<tr><td>간편결제 (카카오페이, 토스페이 등)</td><td>영업일 1~3일</td></tr>
+</table>
+
+<h2>7. 문의</h2>
+<div class="highlight">
+<p>환불 관련 문의사항은 서비스 관리자에게 연락해 주시기 바랍니다.</p>
+</div>`
+}
+
 const mainHTML = `<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -1219,6 +1648,16 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
         <div class="section-title"><i class="fas fa-globe"></i> World</div>
         <div class="section-text" id="loreText"></div>
       </div>
+
+      <!-- Footer (Legal Links) -->
+      <div style="text-align:center;padding:20px 0 40px;border-top:1px solid var(--border);margin-top:16px">
+        <div style="display:flex;justify-content:center;gap:16px;flex-wrap:wrap;margin-bottom:8px">
+          <a href="/terms" style="font-size:11px;color:var(--muted);text-decoration:none">이용약관</a>
+          <a href="/privacy" style="font-size:11px;color:var(--muted);text-decoration:none">개인정보처리방침</a>
+          <a href="/refund" style="font-size:11px;color:var(--muted);text-decoration:none">취소/환불 정책</a>
+        </div>
+        <p style="font-size:10px;color:var(--muted);opacity:.6">© 2025 AI Character Chat. All rights reserved.</p>
+      </div>
     </div>
   </div>
 
@@ -1264,6 +1703,13 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
     </div>
     <div class="error-msg" id="loginError"></div>
     <button class="form-btn" onclick="doLogin()">로그인</button>
+    <div id="socialLoginBtns" style="margin-top:12px;display:none">
+      <div style="text-align:center;font-size:12px;color:var(--muted);margin:8px 0">또는 간편 로그인</div>
+      <div style="display:flex;gap:10px">
+        <button id="googleLoginBtn" class="form-btn" onclick="doSocialLogin('google')" style="flex:1;background:#4285f4;display:none"><svg style="width:16px;height:16px;vertical-align:middle;margin-right:6px" viewBox="0 0 24 24"><path fill="#fff" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.27-4.74 3.27-8.1z"/><path fill="#fff" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#fff" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#fff" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>Google</button>
+        <button id="kakaoLoginBtn" class="form-btn" onclick="doSocialLogin('kakao')" style="flex:1;background:#FEE500;color:#000;display:none"><svg style="width:16px;height:16px;vertical-align:middle;margin-right:6px" viewBox="0 0 24 24"><path fill="#000" d="M12 3C6.48 3 2 6.58 2 10.94c0 2.81 1.87 5.28 4.69 6.68-.15.56-.97 3.6-.99 3.83 0 0-.02.17.09.24.11.06.24.01.24.01.32-.04 3.7-2.44 4.28-2.86.55.08 1.11.12 1.69.12 5.52 0 10-3.58 10-7.94S17.52 3 12 3z"/></svg>카카오</button>
+      </div>
+    </div>
     <div class="form-link">계정이 없으신가요? <a href="#" onclick="showModal('registerModal')">회원가입</a></div>
     <div class="form-link" style="margin-top:8px"><a href="#" onclick="hideModals()">닫기</a></div>
   </div>
@@ -1289,6 +1735,13 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
     </div>
     <div class="error-msg" id="regError"></div>
     <button class="form-btn" onclick="doRegisterStep1()">다음</button>
+    <div id="socialRegBtns" style="margin-top:12px;display:none">
+      <div style="text-align:center;font-size:12px;color:var(--muted);margin:8px 0">또는 간편 가입</div>
+      <div style="display:flex;gap:10px">
+        <button id="googleRegBtn" class="form-btn" onclick="doSocialLogin('google')" style="flex:1;background:#4285f4;display:none"><svg style="width:16px;height:16px;vertical-align:middle;margin-right:6px" viewBox="0 0 24 24"><path fill="#fff" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.27-4.74 3.27-8.1z"/><path fill="#fff" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#fff" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#fff" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>Google</button>
+        <button id="kakaoRegBtn" class="form-btn" onclick="doSocialLogin('kakao')" style="flex:1;background:#FEE500;color:#000;display:none"><svg style="width:16px;height:16px;vertical-align:middle;margin-right:6px" viewBox="0 0 24 24"><path fill="#000" d="M12 3C6.48 3 2 6.58 2 10.94c0 2.81 1.87 5.28 4.69 6.68-.15.56-.97 3.6-.99 3.83 0 0-.02.17.09.24.11.06.24.01.24.01.32-.04 3.7-2.44 4.28-2.86.55.08 1.11.12 1.69.12 5.52 0 10-3.58 10-7.94S17.52 3 12 3z"/></svg>카카오</button>
+      </div>
+    </div>
     <div class="form-link"><a href="#" onclick="showModal('loginModal')">이미 계정이 있나요?</a></div>
     <div class="form-link" style="margin-top:8px"><a href="#" onclick="hideModals()">닫기</a></div>
   </div>
@@ -1370,10 +1823,26 @@ const API = ''
 // ─── Init ───
 async function init() {
   try {
+    // Check for social login callback
+    const urlParams = new URLSearchParams(window.location.search)
+    const socialAuth = urlParams.get('socialAuth')
+    if (socialAuth) {
+      try {
+        const authData = JSON.parse(decodeURIComponent(socialAuth))
+        saveAuth(authData)
+        state.hasHistory = false
+        // Clean URL
+        window.history.replaceState({}, '', '/')
+      } catch {}
+    }
+
     // Load character info
     const charResp = await fetch(API + '/api/character')
     state.character = await charResp.json()
     renderLanding()
+
+    // Load social login config
+    loadSocialConfig()
 
     if (!state.token) {
       await initGuest()
@@ -1891,6 +2360,31 @@ function doLogout() {
   initGuest().then(updateUI)
 }
 
+// ─── Social Login ───
+async function loadSocialConfig() {
+  try {
+    const resp = await fetch(API + '/api/auth/config')
+    const config = await resp.json()
+    if (config.google || config.kakao) {
+      document.getElementById('socialLoginBtns').style.display = 'block'
+      document.getElementById('socialRegBtns').style.display = 'block'
+      if (config.google) {
+        document.getElementById('googleLoginBtn').style.display = 'flex'
+        document.getElementById('googleRegBtn').style.display = 'flex'
+      }
+      if (config.kakao) {
+        document.getElementById('kakaoLoginBtn').style.display = 'flex'
+        document.getElementById('kakaoRegBtn').style.display = 'flex'
+      }
+    }
+  } catch {}
+}
+
+function doSocialLogin(provider) {
+  const guestToken = state.token || ''
+  window.location.href = API + '/api/auth/' + provider + '?guestToken=' + encodeURIComponent(guestToken)
+}
+
 async function resetChat() {
   if (!confirm('대화를 초기화할까요?')) return
   toggleMenu()
@@ -2298,7 +2792,9 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
 
         <div class="nav-section">시스템</div>
         <button class="nav-item" onclick="showPanel('apikeys',this)"><i class="fas fa-key"></i> API 키 관리</button>
+        <button class="nav-item" onclick="showPanel('social',this)"><i class="fas fa-users"></i> 소셜 로그인</button>
         <button class="nav-item" onclick="showPanel('payment',this)"><i class="fas fa-credit-card"></i> 결제 설정</button>
+        <button class="nav-item" onclick="showPanel('password',this)"><i class="fas fa-lock"></i> 비밀번호 변경</button>
         <button class="nav-item" onclick="showPanel('danger',this)"><i class="fas fa-exclamation-triangle"></i> 위험 구역</button>
       </div>
       <div class="sidebar-footer">
@@ -2604,6 +3100,39 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
         </div>
       </div>
 
+      <!-- Social Login Settings -->
+      <div class="panel" id="panel-social">
+        <div class="content-header"><h2>👥 소셜 로그인 설정</h2><p>구글/카카오 간편 로그인을 설정하세요</p></div>
+        <div class="content-body">
+          <div class="card">
+            <div class="card-title"><i class="fab fa-google" style="color:#4285f4"></i> Google OAuth 2.0</div>
+            <p style="font-size:11px;color:var(--muted);margin-bottom:12px">Google Cloud Console → API 및 서비스 → 사용자 인증 정보에서 발급<br>승인된 리디렉션 URI: <code style="background:var(--surface2);padding:2px 6px;border-radius:4px">https://character-chat.com/api/auth/google/callback</code></p>
+            <div class="form-group"><label>Client ID</label><input class="admin-input" id="googleClientId" placeholder="xxxx.apps.googleusercontent.com"></div>
+            <div class="form-group"><label>Client Secret</label><input class="admin-input" id="googleClientSecret" type="password" placeholder="GOCSPX-xxxx"></div>
+          </div>
+          <div class="card" style="margin-top:16px">
+            <div class="card-title"><img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23FEE500' d='M12 3C6.48 3 2 6.58 2 10.94c0 2.81 1.87 5.28 4.69 6.68-.15.56-.97 3.6-.99 3.83 0 0-.02.17.09.24.11.06.24.01.24.01.32-.04 3.7-2.44 4.28-2.86.55.08 1.11.12 1.69.12 5.52 0 10-3.58 10-7.94S17.52 3 12 3z'/%3E%3C/svg%3E" style="width:16px;height:16px;vertical-align:middle;margin-right:4px"> Kakao OAuth 2.0</div>
+            <p style="font-size:11px;color:var(--muted);margin-bottom:12px">Kakao Developers → 앱 설정 → 앱 키에서 발급<br>Redirect URI: <code style="background:var(--surface2);padding:2px 6px;border-radius:4px">https://character-chat.com/api/auth/kakao/callback</code></p>
+            <div class="form-group"><label>REST API 키 (Client ID)</label><input class="admin-input" id="kakaoClientId" placeholder="카카오 REST API 키"></div>
+            <div class="form-group"><label>Client Secret</label><input class="admin-input" id="kakaoClientSecret" type="password" placeholder="카카오 Client Secret (선택)"></div>
+          </div>
+          <button class="btn btn-primary" style="margin-top:16px" onclick="saveSocial()"><i class="fas fa-save"></i> 소셜 로그인 설정 저장</button>
+        </div>
+      </div>
+
+      <!-- Password Change -->
+      <div class="panel" id="panel-password">
+        <div class="content-header"><h2>🔒 비밀번호 변경</h2><p>관리자 로그인 비밀번호를 변경합니다</p></div>
+        <div class="content-body">
+          <div class="card">
+            <div class="form-group"><label>현재 비밀번호</label><input class="admin-input" id="currentPw" type="password" placeholder="현재 비밀번호 입력"></div>
+            <div class="form-group"><label>새 비밀번호</label><input class="admin-input" id="newPw" type="password" placeholder="새 비밀번호 (6자 이상)"></div>
+            <div class="form-group"><label>새 비밀번호 확인</label><input class="admin-input" id="confirmPw" type="password" placeholder="새 비밀번호 재입력"></div>
+            <button class="btn btn-primary" style="margin-top:12px" onclick="changePassword()"><i class="fas fa-key"></i> 비밀번호 변경</button>
+          </div>
+        </div>
+      </div>
+
       <!-- Danger Zone -->
       <div class="panel" id="panel-danger">
         <div class="content-header"><h2>⚠️ 위험 구역</h2><p>되돌릴 수 없는 작업입니다. 신중하게 진행하세요</p></div>
@@ -2654,6 +3183,7 @@ async function loadAll() {
   await loadCharacter()
   loadStats()
   loadPaymentSettings()
+  loadSocial()
 }
 
 async function loadCharacter() {
@@ -2818,6 +3348,54 @@ async function resetSessions() {
   toast('✅ 전체 세션 초기화됨')
 }
 
+// ═══ PASSWORD CHANGE ═══
+async function changePassword() {
+  var cur = document.getElementById('currentPw').value
+  var newP = document.getElementById('newPw').value
+  var conf = document.getElementById('confirmPw').value
+  if (!cur || !newP) { toast('❌ 현재 비밀번호와 새 비밀번호를 입력하세요'); return }
+  if (newP.length < 6) { toast('❌ 새 비밀번호는 6자 이상이어야 합니다'); return }
+  if (newP !== conf) { toast('❌ 새 비밀번호가 일치하지 않습니다'); return }
+  try {
+    var r = await fetch('/api/admin/change-password', { method:'POST', headers:ah(), body:JSON.stringify({currentPassword:cur, newPassword:newP}) })
+    var d = await r.json()
+    if (r.ok) {
+      toast('✅ 비밀번호가 변경되었습니다')
+      document.getElementById('currentPw').value = ''
+      document.getElementById('newPw').value = ''
+      document.getElementById('confirmPw').value = ''
+    } else {
+      toast('❌ ' + (d.error || '변경 실패'))
+    }
+  } catch(e) { toast('❌ 네트워크 오류') }
+}
+
+// ═══ SOCIAL LOGIN SETTINGS ═══
+async function loadSocial() {
+  try {
+    var r = await fetch('/api/admin/social', { headers:ah() })
+    var d = await r.json()
+    document.getElementById('googleClientId').value = d.googleClientId || ''
+    document.getElementById('googleClientSecret').value = ''
+    document.getElementById('googleClientSecret').placeholder = d.googleClientSecretSet ? '(설정됨 — 변경하려면 새로 입력)' : 'Client Secret 입력'
+    document.getElementById('kakaoClientId').value = d.kakaoClientId || ''
+    document.getElementById('kakaoClientSecret').value = ''
+    document.getElementById('kakaoClientSecret').placeholder = d.kakaoClientSecretSet ? '(설정됨 — 변경하려면 새로 입력)' : 'Client Secret 입력 (선택)'
+  } catch(e) {}
+}
+
+async function saveSocial() {
+  var body = { googleClientId: document.getElementById('googleClientId').value }
+  var gs = document.getElementById('googleClientSecret').value
+  if (gs) body.googleClientSecret = gs
+  body.kakaoClientId = document.getElementById('kakaoClientId').value
+  var ks = document.getElementById('kakaoClientSecret').value
+  if (ks) body.kakaoClientSecret = ks
+  await fetch('/api/admin/social', { method:'POST', headers:ah(), body:JSON.stringify(body) })
+  loadSocial()
+  toast('✅ 소셜 로그인 설정 저장됨')
+}
+
 // Navigation
 function showPanel(id, btn) {
   document.querySelectorAll('.panel').forEach(function(p){p.classList.remove('active')})
@@ -2825,7 +3403,7 @@ function showPanel(id, btn) {
   var panel = document.getElementById('panel-'+id)
   if (panel) panel.classList.add('active')
   if (btn) btn.classList.add('active')
-  var titles = {dashboard:'통계 요약',step1:'기본 정보',step2:'오프닝 설정',step3:'캐릭터 프롬프트',step4:'상황 이미지',step5:'캐릭터 상세',step6:'세계관 & 스펙',step7:'동영상 관리',apikeys:'API 키 관리',payment:'결제 설정',danger:'위험 구역'}
+  var titles = {dashboard:'통계 요약',step1:'기본 정보',step2:'오프닝 설정',step3:'캐릭터 프롬프트',step4:'상황 이미지',step5:'캐릭터 상세',step6:'세계관 & 스펙',step7:'동영상 관리',apikeys:'API 키 관리',social:'소셜 로그인',payment:'결제 설정',password:'비밀번호 변경',danger:'위험 구역'}
   document.getElementById('mobileTitle').textContent = titles[id] || ''
   closeSidebar()
 }
