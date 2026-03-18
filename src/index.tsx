@@ -1277,7 +1277,7 @@ ${content}</div></body></html>`
 function termsContent(serviceName: string): string {
   return `
 <h2>제1조 (목적)</h2>
-<p>이 약관은 ${serviceName} (이하 "서비스")가 제공하는 AI 캐릭터 채팅 서비스의 이용과 관련하여 서비스와 이용자 사이의 권리, 의무 및 책임사항을 규정함을 목적으로 합니다.</p>
+<p>이 약관은 에이아이지(aigee)(이하 "회사")가 운영하는 ${serviceName} (이하 "서비스")가 제공하는 AI 캐릭터 채팅 서비스의 이용과 관련하여 회사와 이용자 사이의 권리, 의무 및 책임사항을 규정함을 목적으로 합니다.</p>
 
 <h2>제2조 (용어의 정의)</h2>
 <ul>
@@ -1332,7 +1332,18 @@ function termsContent(serviceName: string): string {
 <h2>제11조 (분쟁 해결)</h2>
 <p>서비스와 이용자 간의 분쟁이 발생한 경우 양 당사자 간의 합의에 의해 해결합니다. 합의가 이루어지지 않을 경우 관할 법원에 소를 제기할 수 있습니다.</p>
 
-<div class="highlight"><p><strong>부칙:</strong> 이 약관은 공시한 날부터 시행합니다.</p></div>`
+<div class="highlight"><p><strong>부칙:</strong> 이 약관은 공시한 날부터 시행합니다.</p></div>
+
+<h2>사업자 정보</h2>
+<table>
+<tr><th>항목</th><th>내용</th></tr>
+<tr><td>상호</td><td>에이아이지(aigee)</td></tr>
+<tr><td>대표자</td><td>이동화</td></tr>
+<tr><td>사업자등록번호</td><td>717-04-02574</td></tr>
+<tr><td>업태/종목</td><td>정보통신업 / 포털 및 기타 인터넷 정보 매개 서비스업, 전자상거래 소매업</td></tr>
+<tr><td>소재지</td><td>경기도 화성시 꽃내음1길 35, 1동 5층 507호(새솔동, 킨슬리오피스텔)</td></tr>
+<tr><td>연락처</td><td>010-5931-7779</td></tr>
+</table>`
 }
 
 function privacyContent(serviceName: string): string {
@@ -1397,8 +1408,21 @@ function privacyContent(serviceName: string): string {
 
 <h2>8. 개인정보 보호책임자</h2>
 <div class="highlight">
-<p>개인정보 관련 문의사항은 서비스 내 관리자에게 연락해 주시기 바랍니다.</p>
-</div>`
+<table style="border:none;margin:0">
+<tr><td style="border:none;padding:4px 12px 4px 0;font-weight:600;color:#c4a8ff">성명</td><td style="border:none;padding:4px 0">이동화</td></tr>
+<tr><td style="border:none;padding:4px 12px 4px 0;font-weight:600;color:#c4a8ff">소속</td><td style="border:none;padding:4px 0">에이아이지(aigee) 대표</td></tr>
+<tr><td style="border:none;padding:4px 12px 4px 0;font-weight:600;color:#c4a8ff">연락처</td><td style="border:none;padding:4px 0">010-5931-7779</td></tr>
+</table>
+</div>
+
+<h2>9. 사업자 정보</h2>
+<table>
+<tr><th>항목</th><th>내용</th></tr>
+<tr><td>상호</td><td>에이아이지(aigee)</td></tr>
+<tr><td>대표자</td><td>이동화</td></tr>
+<tr><td>사업자등록번호</td><td>717-04-02574</td></tr>
+<tr><td>소재지</td><td>경기도 화성시 꽃내음1길 35, 1동 5층 507호(새솔동, 킨슬리오피스텔)</td></tr>
+</table>`
 }
 
 function refundContent(serviceName: string): string {
@@ -1440,7 +1464,13 @@ function refundContent(serviceName: string): string {
 
 <h2>7. 문의</h2>
 <div class="highlight">
-<p>환불 관련 문의사항은 서비스 관리자에게 연락해 주시기 바랍니다.</p>
+<p>환불 관련 문의사항은 아래 연락처로 문의해 주시기 바랍니다.</p>
+<table style="border:none;margin:8px 0 0">
+<tr><td style="border:none;padding:4px 12px 4px 0;font-weight:600;color:#c4a8ff">상호</td><td style="border:none;padding:4px 0">에이아이지(aigee)</td></tr>
+<tr><td style="border:none;padding:4px 12px 4px 0;font-weight:600;color:#c4a8ff">대표자</td><td style="border:none;padding:4px 0">이동화</td></tr>
+<tr><td style="border:none;padding:4px 12px 4px 0;font-weight:600;color:#c4a8ff">연락처</td><td style="border:none;padding:4px 0">010-5931-7779</td></tr>
+<tr><td style="border:none;padding:4px 12px 4px 0;font-weight:600;color:#c4a8ff">사업자등록번호</td><td style="border:none;padding:4px 0">717-04-02574</td></tr>
+</table>
 </div>`
 }
 
@@ -1649,14 +1679,20 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
         <div class="section-text" id="loreText"></div>
       </div>
 
-      <!-- Footer (Legal Links) -->
-      <div style="text-align:center;padding:20px 0 40px;border-top:1px solid var(--border);margin-top:16px">
-        <div style="display:flex;justify-content:center;gap:16px;flex-wrap:wrap;margin-bottom:8px">
+      <!-- Footer (Legal Links + Business Info) -->
+      <div style="text-align:center;padding:20px 16px 40px;border-top:1px solid var(--border);margin-top:16px">
+        <div style="display:flex;justify-content:center;gap:16px;flex-wrap:wrap;margin-bottom:12px">
           <a href="/terms" style="font-size:11px;color:var(--muted);text-decoration:none">이용약관</a>
           <a href="/privacy" style="font-size:11px;color:var(--muted);text-decoration:none">개인정보처리방침</a>
           <a href="/refund" style="font-size:11px;color:var(--muted);text-decoration:none">취소/환불 정책</a>
         </div>
-        <p style="font-size:10px;color:var(--muted);opacity:.6">© 2025 AI Character Chat. All rights reserved.</p>
+        <div style="font-size:10px;color:var(--muted);opacity:.55;line-height:1.8">
+          <p>상호: 에이아이지(aigee) | 대표: 이동화</p>
+          <p>사업자등록번호: 717-04-02574</p>
+          <p>주소: 경기도 화성시 꽃내음1길 35, 1동 5층 507호(새솔동, 킨슬리오피스텔)</p>
+          <p>연락처: 010-5931-7779</p>
+          <p style="margin-top:4px">© 2025 에이아이지(aigee). All rights reserved.</p>
+        </div>
       </div>
     </div>
   </div>
