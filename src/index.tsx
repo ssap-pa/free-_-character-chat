@@ -165,7 +165,7 @@ async function verifyPassword(password: string, stored: string): Promise<boolean
 }
 
 // ─── LLM API Call (Claude 우선 → OpenAI fallback) ───
-async function askClaude(messages: any[], apiKey: string): Promise<string> {
+async function askClaude(messages: any[], apiKey: string): Promise<{text: string, model: string, inputTokens: number, outputTokens: number}> {
   // Convert OpenAI format to Claude format
   const systemMsg = messages.find((m: any) => m.role === 'system')
   const chatMsgs = messages.filter((m: any) => m.role !== 'system')
@@ -193,10 +193,15 @@ async function askClaude(messages: any[], apiKey: string): Promise<string> {
   }
 
   const data: any = await resp.json()
-  return data.content[0].text
+  return {
+    text: data.content[0].text,
+    model: 'claude',
+    inputTokens: data.usage?.input_tokens || 0,
+    outputTokens: data.usage?.output_tokens || 0
+  }
 }
 
-async function askOpenAI(messages: any[], apiKey: string, baseUrl: string): Promise<string> {
+async function askOpenAI(messages: any[], apiKey: string, baseUrl: string): Promise<{text: string, model: string, inputTokens: number, outputTokens: number}> {
   const resp = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -218,10 +223,15 @@ async function askOpenAI(messages: any[], apiKey: string, baseUrl: string): Prom
   }
 
   const data: any = await resp.json()
-  return data.choices[0].message.content
+  return {
+    text: data.choices[0].message.content,
+    model: 'openai',
+    inputTokens: data.usage?.prompt_tokens || 0,
+    outputTokens: data.usage?.completion_tokens || 0
+  }
 }
 
-async function askLLM(messages: any[], env: Bindings): Promise<string> {
+async function askLLM(messages: any[], env: Bindings): Promise<{text: string, model: string, inputTokens: number, outputTokens: number}> {
   // 1) Try Claude API first (priority)
   let claudeKey = ''
   try {
@@ -315,10 +325,10 @@ async function compressHistory(history: any[], env: Bindings): Promise<any[]> {
   try {
     const summaryPrompt = `아래 대화 내용을 한국어로 300자 이내로 요약하세요. 주요 감정, 사건, 관계 변화를 중심으로:\n\n${toSummarize.map((m: any) => `${m.role}: ${m.content}`).join('\n')}`
     
-    const summary = await askLLM([{ role: 'user', content: summaryPrompt }], env)
+    const summaryResult = await askLLM([{ role: 'user', content: summaryPrompt }], env)
     
     return [
-      { role: 'system', content: `[이전 대화 요약] ${summary}` },
+      { role: 'system', content: `[이전 대화 요약] ${summaryResult.text}` },
       ...toKeep
     ]
   } catch {
@@ -610,11 +620,24 @@ app.post('/api/chat', authMiddleware, async (c) => {
   
   // Call LLM
   let aiResponse: string
+  let llmUsage = { model: 'unknown', inputTokens: 0, outputTokens: 0 }
   try {
-    aiResponse = await askLLM(messages, c.env)
+    const llmResult = await askLLM(messages, c.env)
+    aiResponse = llmResult.text
+    llmUsage = { model: llmResult.model, inputTokens: llmResult.inputTokens, outputTokens: llmResult.outputTokens }
   } catch (err: any) {
     return c.json({ error: 'LLM_ERROR', message: err.message }, 500)
   }
+  
+  // Track API usage in D1
+  try {
+    const costPerInputToken = llmUsage.model === 'claude' ? 0.000003 : 0.0000025
+    const costPerOutputToken = llmUsage.model === 'claude' ? 0.000015 : 0.00001
+    const estimatedCost = (llmUsage.inputTokens * costPerInputToken) + (llmUsage.outputTokens * costPerOutputToken)
+    await c.env.DB.prepare(
+      'INSERT INTO api_usage (user_id, model, input_tokens, output_tokens, estimated_cost) VALUES (?, ?, ?, ?, ?)'
+    ).bind(userId, llmUsage.model, llmUsage.inputTokens, llmUsage.outputTokens, estimatedCost).run()
+  } catch {}
   
   // 후처리: 상황묘사(*...*) 안의 '사용자' → '나/내'로, 대사 안은 호칭으로 치환
   aiResponse = aiResponse.replace(/\*([^*]+)\*/g, (match) => {
@@ -990,16 +1013,180 @@ app.delete('/api/admin/character/situation/:id', adminAuth, async (c) => {
   return c.json({ success: true })
 })
 
-// GET /api/admin/stats - Basic stats
+// GET /api/admin/stats - Enhanced stats
 app.get('/api/admin/stats', adminAuth, async (c) => {
   const totalUsers = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM users WHERE is_guest = 0').first()
   const totalGuests = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM users WHERE is_guest = 1').first()
   const totalSessions = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM sessions').first()
+  const totalTokensUsed = await c.env.DB.prepare('SELECT COALESCE(SUM(token_used),0) as total FROM users').first()
+  const totalPayments = await c.env.DB.prepare('SELECT COUNT(*) as cnt, COALESCE(SUM(amount),0) as total FROM payments WHERE status = ?').bind('confirmed').first()
+  const totalApiCost = await c.env.DB.prepare('SELECT COALESCE(SUM(estimated_cost),0) as total, COUNT(*) as cnt FROM api_usage').first()
   return c.json({
     members: (totalUsers as any)?.cnt || 0,
     guests: (totalGuests as any)?.cnt || 0,
-    sessions: (totalSessions as any)?.cnt || 0
+    sessions: (totalSessions as any)?.cnt || 0,
+    totalTokensUsed: (totalTokensUsed as any)?.total || 0,
+    totalRevenue: (totalPayments as any)?.total || 0,
+    totalPaymentCount: (totalPayments as any)?.cnt || 0,
+    totalApiCost: (totalApiCost as any)?.total || 0,
+    totalApiCalls: (totalApiCost as any)?.cnt || 0
   })
+})
+
+// GET /api/admin/members - Member list with details
+app.get('/api/admin/members', adminAuth, async (c) => {
+  const page = parseInt(c.req.query('page') || '1')
+  const limit = parseInt(c.req.query('limit') || '50')
+  const search = c.req.query('search') || ''
+  const offset = (page - 1) * limit
+
+  let query = 'SELECT id, email, nickname, char_name, token_used, token_limit, is_guest, created_at FROM users WHERE is_guest = 0'
+  let countQuery = 'SELECT COUNT(*) as cnt FROM users WHERE is_guest = 0'
+  const params: any[] = []
+
+  if (search) {
+    query += ' AND (email LIKE ? OR nickname LIKE ?)'
+    countQuery += ' AND (email LIKE ? OR nickname LIKE ?)'
+    params.push('%' + search + '%', '%' + search + '%')
+  }
+
+  query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?'
+
+  const countResult: any = search
+    ? await c.env.DB.prepare(countQuery).bind(...params).first()
+    : await c.env.DB.prepare(countQuery).first()
+
+  const members = search
+    ? await c.env.DB.prepare(query).bind(...params, limit, offset).all()
+    : await c.env.DB.prepare(query).bind(limit, offset).all()
+
+  // Get session count per user
+  const memberData = []
+  for (const m of (members.results || [])) {
+    const sessCount: any = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM sessions WHERE user_id = ?').bind((m as any).id).first()
+    const paymentSum: any = await c.env.DB.prepare('SELECT COALESCE(SUM(amount),0) as total, COUNT(*) as cnt FROM payments WHERE user_id = ? AND status = ?').bind((m as any).id, 'confirmed').first()
+    memberData.push({
+      ...m,
+      sessionCount: sessCount?.cnt || 0,
+      totalPaid: paymentSum?.total || 0,
+      paymentCount: paymentSum?.cnt || 0
+    })
+  }
+
+  return c.json({
+    members: memberData,
+    total: countResult?.cnt || 0,
+    page,
+    limit,
+    totalPages: Math.ceil((countResult?.cnt || 0) / limit)
+  })
+})
+
+// GET /api/admin/payments - Payment history
+app.get('/api/admin/payments', adminAuth, async (c) => {
+  const page = parseInt(c.req.query('page') || '1')
+  const limit = parseInt(c.req.query('limit') || '50')
+  const offset = (page - 1) * limit
+
+  const countResult: any = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM payments').first()
+
+  const payments = await c.env.DB.prepare(`
+    SELECT p.*, u.email, u.nickname
+    FROM payments p
+    LEFT JOIN users u ON p.user_id = u.id
+    ORDER BY p.created_at DESC
+    LIMIT ? OFFSET ?
+  `).bind(limit, offset).all()
+
+  const totalRevenue: any = await c.env.DB.prepare('SELECT COALESCE(SUM(amount),0) as total FROM payments WHERE status = ?').bind('confirmed').first()
+
+  return c.json({
+    payments: payments.results || [],
+    total: countResult?.cnt || 0,
+    totalRevenue: totalRevenue?.total || 0,
+    page,
+    limit,
+    totalPages: Math.ceil((countResult?.cnt || 0) / limit)
+  })
+})
+
+// GET /api/admin/revenue - Revenue dashboard data
+app.get('/api/admin/revenue', adminAuth, async (c) => {
+  // Total revenue
+  const totalRevenue: any = await c.env.DB.prepare('SELECT COALESCE(SUM(amount),0) as total, COUNT(*) as cnt FROM payments WHERE status = ?').bind('confirmed').first()
+
+  // Total API cost
+  const totalApiCost: any = await c.env.DB.prepare('SELECT COALESCE(SUM(estimated_cost),0) as total, COUNT(*) as cnt, COALESCE(SUM(input_tokens),0) as input_tokens, COALESCE(SUM(output_tokens),0) as output_tokens FROM api_usage').first()
+
+  // Revenue by plan
+  const revenueByPlan = await c.env.DB.prepare(`
+    SELECT plan_name, plan_id, COUNT(*) as cnt, SUM(amount) as total, SUM(tokens) as total_tokens
+    FROM payments WHERE status = 'confirmed'
+    GROUP BY plan_id ORDER BY total DESC
+  `).all()
+
+  // Daily revenue (last 30 days)
+  const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000)
+  const dailyRevenue = await c.env.DB.prepare(`
+    SELECT 
+      CAST((created_at / 86400000) AS INTEGER) as day_key,
+      DATE(created_at / 1000, 'unixepoch') as date,
+      SUM(amount) as revenue,
+      COUNT(*) as transactions
+    FROM payments 
+    WHERE status = 'confirmed' AND created_at > ?
+    GROUP BY day_key ORDER BY day_key DESC
+  `).bind(thirtyDaysAgo).all()
+
+  // Daily API cost (last 30 days)
+  const dailyApiCost = await c.env.DB.prepare(`
+    SELECT 
+      CAST((created_at / 86400000) AS INTEGER) as day_key,
+      DATE(created_at / 1000, 'unixepoch') as date,
+      SUM(estimated_cost) as cost,
+      COUNT(*) as calls,
+      SUM(input_tokens) as input_tokens,
+      SUM(output_tokens) as output_tokens
+    FROM api_usage
+    WHERE created_at > ?
+    GROUP BY day_key ORDER BY day_key DESC
+  `).bind(thirtyDaysAgo).all()
+
+  // Top paying users
+  const topPayers = await c.env.DB.prepare(`
+    SELECT u.email, u.nickname, SUM(p.amount) as total_paid, COUNT(p.id) as payment_count, SUM(p.tokens) as total_tokens
+    FROM payments p JOIN users u ON p.user_id = u.id
+    WHERE p.status = 'confirmed'
+    GROUP BY p.user_id ORDER BY total_paid DESC LIMIT 10
+  `).all()
+
+  // API cost by model
+  const costByModel = await c.env.DB.prepare(`
+    SELECT model, COUNT(*) as calls, SUM(input_tokens) as input_tokens, SUM(output_tokens) as output_tokens, SUM(estimated_cost) as cost
+    FROM api_usage GROUP BY model
+  `).all()
+
+  return c.json({
+    totalRevenue: totalRevenue?.total || 0,
+    totalPayments: totalRevenue?.cnt || 0,
+    totalApiCost: totalApiCost?.total || 0,
+    totalApiCalls: totalApiCost?.cnt || 0,
+    totalInputTokens: totalApiCost?.input_tokens || 0,
+    totalOutputTokens: totalApiCost?.output_tokens || 0,
+    netProfit: (totalRevenue?.total || 0) - Math.round((totalApiCost?.total || 0) * 1400),
+    revenueByPlan: revenueByPlan.results || [],
+    dailyRevenue: dailyRevenue.results || [],
+    dailyApiCost: dailyApiCost.results || [],
+    topPayers: topPayers.results || [],
+    costByModel: costByModel.results || []
+  })
+})
+
+// POST /api/admin/api-cost-rate - Set manual API cost rate (원/달러 환율)
+app.post('/api/admin/api-cost-rate', adminAuth, async (c) => {
+  const { rate } = await c.req.json()
+  await c.env.KV.put('api_cost_rate', String(rate || 1400))
+  return c.json({ success: true })
 })
 
 // ═══  PAYMENT API (토스 페이먼츠)  ═══
@@ -1055,7 +1242,7 @@ app.post('/api/payment/prepare', authMiddleware, async (c) => {
   
   // Store order in KV (expires in 30 min)
   await c.env.KV.put('order_' + orderId, JSON.stringify({
-    userId, planId, tokens: plan.tokens, price: plan.price, status: 'pending', createdAt: Date.now()
+    userId, planId, planName: plan.name, tokens: plan.tokens, price: plan.price, status: 'pending', createdAt: Date.now()
   }), { expirationTtl: 1800 })
   
   return c.json({ orderId, amount: plan.price, orderName: plan.name })
@@ -1099,6 +1286,11 @@ app.post('/api/payment/confirm', authMiddleware, async (c) => {
   await c.env.DB.prepare(
     'UPDATE users SET token_limit = token_limit + ? WHERE id = ?'
   ).bind(order.tokens, userId).run()
+  
+  // Record payment in D1
+  await c.env.DB.prepare(
+    'INSERT INTO payments (user_id, order_id, payment_key, plan_id, plan_name, tokens, amount, status, confirmed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).bind(userId, orderId, paymentKey, order.planId, order.planName || order.planId, order.tokens, order.price, 'confirmed', Date.now()).run()
   
   // Update order status
   await c.env.KV.put('order_' + orderId, JSON.stringify({ ...order, status: 'confirmed', paymentKey }))
@@ -1301,7 +1493,7 @@ app.get('/admin/', async (c) => {
 // ─── Legal Page Templates ───
 function legalPageHTML(title: string, serviceName: string, content: string): string {
   return `<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${title} — ${serviceName}</title>
+<title>${title} — ${serviceName}</title><link rel="icon" type="image/png" href="/static/favicon.png">
 <style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a10;color:#e8e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',sans-serif;line-height:1.8}
 .container{max-width:720px;margin:0 auto;padding:40px 20px 80px}.back{display:inline-block;color:#a07de0;text-decoration:none;margin-bottom:24px;font-size:14px}
 h1{font-size:24px;font-weight:800;margin-bottom:8px;color:#c4a8ff}
@@ -1527,6 +1719,7 @@ const mainHTML = `<!DOCTYPE html>
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#0a0a10">
 <title>도하준 — AI Character Chat</title>
+<link rel="icon" type="image/png" href="/static/favicon.png">
 <link rel="manifest" href="/static/manifest.json">
 <link rel="apple-touch-icon" href="/static/icon-192.png">
 <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
@@ -2748,6 +2941,7 @@ const adminHTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>관리자 패널</title>
+<link rel="icon" type="image/png" href="/static/favicon.png">
 <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -2926,6 +3120,9 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
         <button class="nav-item" onclick="showPanel('step7',this)"><span class="step-num">7</span> 동영상 관리</button>
 
         <div class="nav-section">시스템</div>
+        <button class="nav-item" onclick="showPanel('members',this)"><i class="fas fa-users-cog"></i> 회원 관리</button>
+        <button class="nav-item" onclick="showPanel('payhistory',this)"><i class="fas fa-receipt"></i> 결제 내역</button>
+        <button class="nav-item" onclick="showPanel('revenue',this)"><i class="fas fa-chart-line"></i> 수익 현황</button>
         <button class="nav-item" onclick="showPanel('apikeys',this)"><i class="fas fa-key"></i> API 키 관리</button>
         <button class="nav-item" onclick="showPanel('social',this)"><i class="fas fa-users"></i> 소셜 로그인</button>
         <button class="nav-item" onclick="showPanel('payment',this)"><i class="fas fa-credit-card"></i> 결제 설정</button>
@@ -2953,10 +3150,117 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-
             <div class="stat-card"><div class="stat-value" id="statMembers">-</div><div class="stat-label">회원 수</div></div>
             <div class="stat-card"><div class="stat-value" id="statGuests">-</div><div class="stat-label">게스트 수</div></div>
             <div class="stat-card"><div class="stat-value" id="statSessions">-</div><div class="stat-label">세션 수</div></div>
+            <div class="stat-card"><div class="stat-value" id="statTokens">-</div><div class="stat-label">총 토큰 사용</div></div>
           </div>
-          <div class="card">
+          <div class="stats-grid" style="margin-top:12px">
+            <div class="stat-card" style="border-left:3px solid var(--ok)"><div class="stat-value" id="statRevenue" style="color:var(--ok)">-</div><div class="stat-label">총 수익 (원)</div></div>
+            <div class="stat-card" style="border-left:3px solid var(--warn)"><div class="stat-value" id="statApiCost" style="color:var(--warn)">-</div><div class="stat-label">API 비용 (원)</div></div>
+            <div class="stat-card" style="border-left:3px solid var(--accent2)"><div class="stat-value" id="statProfit" style="color:var(--accent2)">-</div><div class="stat-label">순수익 (원)</div></div>
+            <div class="stat-card"><div class="stat-value" id="statApiCalls">-</div><div class="stat-label">API 호출 수</div></div>
+          </div>
+          <div class="card" style="margin-top:16px">
             <div class="card-title"><i class="fas fa-info-circle"></i> 시스템 정보</div>
             <div id="sysInfo" style="font-size:13px;color:var(--muted);line-height:1.8"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Members Management -->
+      <div class="panel" id="panel-members">
+        <div class="content-header"><h2>👥 회원 관리</h2><p>가입 회원의 이메일, 토큰 사용량, 결제 현황을 확인합니다</p></div>
+        <div class="content-body">
+          <div class="card">
+            <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
+              <input class="admin-input" id="memberSearch" placeholder="이메일 또는 닉네임 검색..." style="flex:1;min-width:200px" onkeydown="if(event.key==='Enter')loadMembers()">
+              <button class="btn btn-primary" onclick="loadMembers()"><i class="fas fa-search"></i> 검색</button>
+            </div>
+            <div style="overflow-x:auto">
+              <table style="width:100%;border-collapse:collapse;font-size:13px">
+                <thead>
+                  <tr style="border-bottom:2px solid var(--border);text-align:left">
+                    <th style="padding:10px 8px;color:var(--muted);font-weight:600">이메일</th>
+                    <th style="padding:10px 8px;color:var(--muted);font-weight:600">닉네임</th>
+                    <th style="padding:10px 8px;color:var(--muted);font-weight:600;text-align:center">토큰 사용</th>
+                    <th style="padding:10px 8px;color:var(--muted);font-weight:600;text-align:center">토큰 한도</th>
+                    <th style="padding:10px 8px;color:var(--muted);font-weight:600;text-align:center">세션</th>
+                    <th style="padding:10px 8px;color:var(--muted);font-weight:600;text-align:right">결제액</th>
+                    <th style="padding:10px 8px;color:var(--muted);font-weight:600">가입일</th>
+                  </tr>
+                </thead>
+                <tbody id="memberTableBody">
+                  <tr><td colspan="7" style="padding:20px;text-align:center;color:var(--muted)">로딩 중...</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div id="memberPagination" style="display:flex;justify-content:center;gap:8px;margin-top:16px"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Payment History -->
+      <div class="panel" id="panel-payhistory">
+        <div class="content-header"><h2>💳 결제 내역</h2><p>결제 발생 내역과 금액을 확인합니다</p></div>
+        <div class="content-body">
+          <div class="stats-grid" style="margin-bottom:16px">
+            <div class="stat-card" style="border-left:3px solid var(--ok)"><div class="stat-value" id="payTotalRevenue" style="color:var(--ok)">-</div><div class="stat-label">총 결제액</div></div>
+            <div class="stat-card"><div class="stat-value" id="payTotalCount">-</div><div class="stat-label">총 결제 건수</div></div>
+          </div>
+          <div class="card">
+            <div style="overflow-x:auto">
+              <table style="width:100%;border-collapse:collapse;font-size:13px">
+                <thead>
+                  <tr style="border-bottom:2px solid var(--border);text-align:left">
+                    <th style="padding:10px 8px;color:var(--muted);font-weight:600">일시</th>
+                    <th style="padding:10px 8px;color:var(--muted);font-weight:600">이메일</th>
+                    <th style="padding:10px 8px;color:var(--muted);font-weight:600">상품</th>
+                    <th style="padding:10px 8px;color:var(--muted);font-weight:600;text-align:center">토큰</th>
+                    <th style="padding:10px 8px;color:var(--muted);font-weight:600;text-align:right">금액</th>
+                    <th style="padding:10px 8px;color:var(--muted);font-weight:600;text-align:center">상태</th>
+                  </tr>
+                </thead>
+                <tbody id="paymentTableBody">
+                  <tr><td colspan="6" style="padding:20px;text-align:center;color:var(--muted)">로딩 중...</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div id="paymentPagination" style="display:flex;justify-content:center;gap:8px;margin-top:16px"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Revenue Dashboard -->
+      <div class="panel" id="panel-revenue">
+        <div class="content-header"><h2>📈 수익 현황</h2><p>매출, API 비용, 순수익을 분석합니다</p></div>
+        <div class="content-body">
+          <div class="stats-grid">
+            <div class="stat-card" style="border-left:3px solid var(--ok)"><div class="stat-value" id="revTotalRevenue" style="color:var(--ok)">-</div><div class="stat-label">총 매출 (원)</div></div>
+            <div class="stat-card" style="border-left:3px solid var(--warn)"><div class="stat-value" id="revApiCost" style="color:var(--warn)">-</div><div class="stat-label">API 비용 (원)</div></div>
+            <div class="stat-card" style="border-left:3px solid var(--accent2)"><div class="stat-value" id="revNetProfit" style="color:var(--accent2)">-</div><div class="stat-label">순수익 (원)</div></div>
+            <div class="stat-card"><div class="stat-value" id="revMargin">-</div><div class="stat-label">마진율</div></div>
+          </div>
+
+          <!-- API Usage by Model -->
+          <div class="card" style="margin-top:16px">
+            <div class="card-title"><i class="fas fa-robot"></i> 모델별 API 사용량</div>
+            <div id="modelUsageTable" style="font-size:13px"></div>
+          </div>
+
+          <!-- Revenue by Plan -->
+          <div class="card" style="margin-top:16px">
+            <div class="card-title"><i class="fas fa-box"></i> 상품별 매출</div>
+            <div id="planRevenueTable" style="font-size:13px"></div>
+          </div>
+
+          <!-- Top Paying Users -->
+          <div class="card" style="margin-top:16px">
+            <div class="card-title"><i class="fas fa-crown"></i> 상위 결제 고객 (Top 10)</div>
+            <div id="topPayersTable" style="font-size:13px"></div>
+          </div>
+
+          <!-- Daily Revenue (last 30 days) -->
+          <div class="card" style="margin-top:16px">
+            <div class="card-title"><i class="fas fa-calendar-alt"></i> 일별 매출/비용 (최근 30일)</div>
+            <div id="dailyRevenueTable" style="font-size:13px;max-height:400px;overflow-y:auto"></div>
           </div>
         </div>
       </div>
@@ -3348,6 +3652,14 @@ async function loadStats() {
     document.getElementById('statMembers').textContent = d.members
     document.getElementById('statGuests').textContent = d.guests
     document.getElementById('statSessions').textContent = d.sessions
+    document.getElementById('statTokens').textContent = d.totalTokensUsed.toLocaleString()
+    document.getElementById('statRevenue').textContent = '₩' + (d.totalRevenue || 0).toLocaleString()
+    var apiCostKRW = Math.round((d.totalApiCost || 0) * 1400)
+    document.getElementById('statApiCost').textContent = '₩' + apiCostKRW.toLocaleString()
+    var profit = (d.totalRevenue || 0) - apiCostKRW
+    document.getElementById('statProfit').textContent = (profit >= 0 ? '+' : '') + '₩' + profit.toLocaleString()
+    document.getElementById('statProfit').style.color = profit >= 0 ? 'var(--ok)' : 'var(--err)'
+    document.getElementById('statApiCalls').textContent = (d.totalApiCalls || 0).toLocaleString()
   } catch(e) {}
   var sr = await fetch('/api/status')
   var sd = await sr.json()
@@ -3358,7 +3670,6 @@ async function loadStats() {
     '<b>OpenAI:</b> ' + openaiIcon + (sd.openai === 'configured' ? ' 연결됨' : ' 미설정') + '<br>' +
     '<b>캐릭터:</b> ' + (charData.name || '-') + '<br>' +
     '<b>장르:</b> ' + (charData.genre || '-')
-  // Update API key panel statuses
   var cs = document.getElementById('claudeStatus')
   var os = document.getElementById('openaiStatus')
   if (cs) cs.innerHTML = sd.claude === 'configured' ? '<span style="color:var(--ok)">✅ 키 설정됨 (활성)</span>' : '<span style="color:var(--warn)">⚠️ 미설정</span>'
@@ -3483,6 +3794,170 @@ async function resetSessions() {
   toast('✅ 전체 세션 초기화됨')
 }
 
+// ═══ MEMBERS MANAGEMENT ═══
+var memberPage = 1
+async function loadMembers(page) {
+  if (page) memberPage = page
+  var search = document.getElementById('memberSearch').value.trim()
+  try {
+    var r = await fetch('/api/admin/members?page=' + memberPage + '&limit=20&search=' + encodeURIComponent(search), { headers:ah() })
+    var d = await r.json()
+    var tbody = document.getElementById('memberTableBody')
+    if (!d.members || d.members.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" style="padding:20px;text-align:center;color:var(--muted)">회원이 없습니다</td></tr>'
+      document.getElementById('memberPagination').innerHTML = ''
+      return
+    }
+    var html = ''
+    for (var i = 0; i < d.members.length; i++) {
+      var m = d.members[i]
+      var dt = m.created_at ? new Date(m.created_at) : null
+      var dateStr = dt ? dt.getFullYear()+'-'+(dt.getMonth()+1).toString().padStart(2,'0')+'-'+dt.getDate().toString().padStart(2,'0') : '-'
+      var usagePercent = m.token_limit > 0 ? Math.round(m.token_used / m.token_limit * 100) : 0
+      var usageColor = usagePercent > 80 ? 'var(--err)' : usagePercent > 50 ? 'var(--warn)' : 'var(--ok)'
+      html += '<tr style="border-bottom:1px solid var(--border)">'
+      html += '<td style="padding:10px 8px;font-size:12px">' + esc(m.email || '-') + '</td>'
+      html += '<td style="padding:10px 8px">' + esc(m.nickname || '-') + '</td>'
+      html += '<td style="padding:10px 8px;text-align:center"><span style="color:'+usageColor+'">' + m.token_used + '</span></td>'
+      html += '<td style="padding:10px 8px;text-align:center">' + m.token_limit + '</td>'
+      html += '<td style="padding:10px 8px;text-align:center">' + (m.sessionCount || 0) + '</td>'
+      html += '<td style="padding:10px 8px;text-align:right;color:var(--ok)">' + (m.totalPaid > 0 ? '₩' + m.totalPaid.toLocaleString() : '-') + '</td>'
+      html += '<td style="padding:10px 8px;font-size:12px;color:var(--muted)">' + dateStr + '</td>'
+      html += '</tr>'
+    }
+    tbody.innerHTML = html
+    // Pagination
+    var pag = ''
+    if (d.totalPages > 1) {
+      for (var p = 1; p <= d.totalPages; p++) {
+        pag += '<button class="btn btn-sm" style="'+(p===d.page?'background:var(--accent);color:#fff':'')+'" onclick="loadMembers('+p+')">'+p+'</button>'
+      }
+    }
+    document.getElementById('memberPagination').innerHTML = pag
+  } catch(e) { document.getElementById('memberTableBody').innerHTML = '<tr><td colspan="7" style="padding:20px;text-align:center;color:var(--err)">로딩 실패</td></tr>' }
+}
+
+// ═══ PAYMENT HISTORY ═══
+var payPage = 1
+async function loadPayHistory(page) {
+  if (page) payPage = page
+  try {
+    var r = await fetch('/api/admin/payments?page=' + payPage + '&limit=20', { headers:ah() })
+    var d = await r.json()
+    document.getElementById('payTotalRevenue').textContent = '₩' + (d.totalRevenue || 0).toLocaleString()
+    document.getElementById('payTotalCount').textContent = d.total || 0
+    var tbody = document.getElementById('paymentTableBody')
+    if (!d.payments || d.payments.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" style="padding:20px;text-align:center;color:var(--muted)">결제 내역이 없습니다</td></tr>'
+      document.getElementById('paymentPagination').innerHTML = ''
+      return
+    }
+    var html = ''
+    for (var i = 0; i < d.payments.length; i++) {
+      var p = d.payments[i]
+      var dt = p.created_at ? new Date(p.created_at) : null
+      var dateStr = dt ? dt.getFullYear()+'-'+(dt.getMonth()+1).toString().padStart(2,'0')+'-'+dt.getDate().toString().padStart(2,'0')+' '+dt.getHours().toString().padStart(2,'0')+':'+dt.getMinutes().toString().padStart(2,'0') : '-'
+      var statusBadge = p.status === 'confirmed' ? '<span style="background:rgba(76,175,137,.15);color:var(--ok);padding:2px 8px;border-radius:8px;font-size:11px">완료</span>' : '<span style="background:rgba(224,160,96,.15);color:var(--warn);padding:2px 8px;border-radius:8px;font-size:11px">'+esc(p.status)+'</span>'
+      html += '<tr style="border-bottom:1px solid var(--border)">'
+      html += '<td style="padding:10px 8px;font-size:12px;color:var(--muted)">' + dateStr + '</td>'
+      html += '<td style="padding:10px 8px;font-size:12px">' + esc(p.email || p.nickname || p.user_id) + '</td>'
+      html += '<td style="padding:10px 8px">' + esc(p.plan_name || p.plan_id) + '</td>'
+      html += '<td style="padding:10px 8px;text-align:center">' + p.tokens + '회</td>'
+      html += '<td style="padding:10px 8px;text-align:right;font-weight:600">₩' + (p.amount || 0).toLocaleString() + '</td>'
+      html += '<td style="padding:10px 8px;text-align:center">' + statusBadge + '</td>'
+      html += '</tr>'
+    }
+    tbody.innerHTML = html
+    var pag = ''
+    if (d.totalPages > 1) {
+      for (var pg = 1; pg <= d.totalPages; pg++) {
+        pag += '<button class="btn btn-sm" style="'+(pg===d.page?'background:var(--accent);color:#fff':'')+'" onclick="loadPayHistory('+pg+')">'+pg+'</button>'
+      }
+    }
+    document.getElementById('paymentPagination').innerHTML = pag
+  } catch(e) { document.getElementById('paymentTableBody').innerHTML = '<tr><td colspan="6" style="padding:20px;text-align:center;color:var(--err)">로딩 실패</td></tr>' }
+}
+
+// ═══ REVENUE DASHBOARD ═══
+async function loadRevenue() {
+  try {
+    var r = await fetch('/api/admin/revenue', { headers:ah() })
+    var d = await r.json()
+    var apiCostKRW = Math.round((d.totalApiCost || 0) * 1400)
+    var revenue = d.totalRevenue || 0
+    var profit = revenue - apiCostKRW
+    var margin = revenue > 0 ? Math.round((profit / revenue) * 100) : 0
+
+    document.getElementById('revTotalRevenue').textContent = '₩' + revenue.toLocaleString()
+    document.getElementById('revApiCost').textContent = '₩' + apiCostKRW.toLocaleString()
+    document.getElementById('revNetProfit').textContent = (profit >= 0 ? '+' : '') + '₩' + profit.toLocaleString()
+    document.getElementById('revNetProfit').style.color = profit >= 0 ? 'var(--ok)' : 'var(--err)'
+    document.getElementById('revMargin').textContent = margin + '%'
+    document.getElementById('revMargin').style.color = margin >= 0 ? 'var(--ok)' : 'var(--err)'
+
+    // Model usage table
+    var modelHtml = '<table style="width:100%;border-collapse:collapse"><thead><tr style="border-bottom:1px solid var(--border)"><th style="padding:8px;text-align:left;color:var(--muted)">모델</th><th style="padding:8px;text-align:right;color:var(--muted)">호출 수</th><th style="padding:8px;text-align:right;color:var(--muted)">입력 토큰</th><th style="padding:8px;text-align:right;color:var(--muted)">출력 토큰</th><th style="padding:8px;text-align:right;color:var(--muted)">비용 ($)</th><th style="padding:8px;text-align:right;color:var(--muted)">비용 (₩)</th></tr></thead><tbody>'
+    if (d.costByModel && d.costByModel.length > 0) {
+      for (var i = 0; i < d.costByModel.length; i++) {
+        var m = d.costByModel[i]
+        modelHtml += '<tr style="border-bottom:1px solid var(--border)"><td style="padding:8px;font-weight:600">' + esc(m.model) + '</td><td style="padding:8px;text-align:right">' + (m.calls||0).toLocaleString() + '</td><td style="padding:8px;text-align:right">' + (m.input_tokens||0).toLocaleString() + '</td><td style="padding:8px;text-align:right">' + (m.output_tokens||0).toLocaleString() + '</td><td style="padding:8px;text-align:right;color:var(--warn)">$' + (m.cost||0).toFixed(4) + '</td><td style="padding:8px;text-align:right;color:var(--warn)">₩' + Math.round((m.cost||0)*1400).toLocaleString() + '</td></tr>'
+      }
+    } else { modelHtml += '<tr><td colspan="6" style="padding:12px;color:var(--muted);text-align:center">데이터 없음</td></tr>' }
+    modelHtml += '</tbody></table>'
+    document.getElementById('modelUsageTable').innerHTML = modelHtml
+
+    // Plan revenue table
+    var planHtml = '<table style="width:100%;border-collapse:collapse"><thead><tr style="border-bottom:1px solid var(--border)"><th style="padding:8px;text-align:left;color:var(--muted)">상품</th><th style="padding:8px;text-align:right;color:var(--muted)">건수</th><th style="padding:8px;text-align:right;color:var(--muted)">토큰</th><th style="padding:8px;text-align:right;color:var(--muted)">매출</th></tr></thead><tbody>'
+    if (d.revenueByPlan && d.revenueByPlan.length > 0) {
+      for (var i = 0; i < d.revenueByPlan.length; i++) {
+        var p = d.revenueByPlan[i]
+        planHtml += '<tr style="border-bottom:1px solid var(--border)"><td style="padding:8px;font-weight:600">' + esc(p.plan_name||p.plan_id) + '</td><td style="padding:8px;text-align:right">' + (p.cnt||0) + '건</td><td style="padding:8px;text-align:right">' + (p.total_tokens||0).toLocaleString() + '</td><td style="padding:8px;text-align:right;color:var(--ok)">₩' + (p.total||0).toLocaleString() + '</td></tr>'
+      }
+    } else { planHtml += '<tr><td colspan="4" style="padding:12px;color:var(--muted);text-align:center">데이터 없음</td></tr>' }
+    planHtml += '</tbody></table>'
+    document.getElementById('planRevenueTable').innerHTML = planHtml
+
+    // Top payers table
+    var payerHtml = '<table style="width:100%;border-collapse:collapse"><thead><tr style="border-bottom:1px solid var(--border)"><th style="padding:8px;text-align:left;color:var(--muted)">#</th><th style="padding:8px;text-align:left;color:var(--muted)">이메일</th><th style="padding:8px;text-align:left;color:var(--muted)">닉네임</th><th style="padding:8px;text-align:right;color:var(--muted)">결제 건수</th><th style="padding:8px;text-align:right;color:var(--muted)">총 결제액</th></tr></thead><tbody>'
+    if (d.topPayers && d.topPayers.length > 0) {
+      for (var i = 0; i < d.topPayers.length; i++) {
+        var u = d.topPayers[i]
+        payerHtml += '<tr style="border-bottom:1px solid var(--border)"><td style="padding:8px;color:var(--muted)">' + (i+1) + '</td><td style="padding:8px;font-size:12px">' + esc(u.email||'-') + '</td><td style="padding:8px">' + esc(u.nickname||'-') + '</td><td style="padding:8px;text-align:right">' + (u.payment_count||0) + '건</td><td style="padding:8px;text-align:right;color:var(--ok);font-weight:600">₩' + (u.total_paid||0).toLocaleString() + '</td></tr>'
+      }
+    } else { payerHtml += '<tr><td colspan="5" style="padding:12px;color:var(--muted);text-align:center">데이터 없음</td></tr>' }
+    payerHtml += '</tbody></table>'
+    document.getElementById('topPayersTable').innerHTML = payerHtml
+
+    // Daily revenue/cost table
+    var dailyHtml = '<table style="width:100%;border-collapse:collapse"><thead><tr style="border-bottom:1px solid var(--border)"><th style="padding:8px;text-align:left;color:var(--muted)">날짜</th><th style="padding:8px;text-align:right;color:var(--muted)">매출</th><th style="padding:8px;text-align:right;color:var(--muted)">결제 건</th><th style="padding:8px;text-align:right;color:var(--muted)">API 비용</th><th style="padding:8px;text-align:right;color:var(--muted)">API 호출</th><th style="padding:8px;text-align:right;color:var(--muted)">순수익</th></tr></thead><tbody>'
+    // Merge daily data
+    var dailyMap = {}
+    if (d.dailyRevenue) for (var i = 0; i < d.dailyRevenue.length; i++) {
+      var dr = d.dailyRevenue[i]
+      if (!dailyMap[dr.date]) dailyMap[dr.date] = {revenue:0,transactions:0,cost:0,calls:0}
+      dailyMap[dr.date].revenue = dr.revenue || 0
+      dailyMap[dr.date].transactions = dr.transactions || 0
+    }
+    if (d.dailyApiCost) for (var i = 0; i < d.dailyApiCost.length; i++) {
+      var dc = d.dailyApiCost[i]
+      if (!dailyMap[dc.date]) dailyMap[dc.date] = {revenue:0,transactions:0,cost:0,calls:0}
+      dailyMap[dc.date].cost = dc.cost || 0
+      dailyMap[dc.date].calls = dc.calls || 0
+    }
+    var dates = Object.keys(dailyMap).sort().reverse()
+    if (dates.length > 0) {
+      for (var i = 0; i < dates.length; i++) {
+        var dd = dailyMap[dates[i]]
+        var dayCostKRW = Math.round(dd.cost * 1400)
+        var dayProfit = dd.revenue - dayCostKRW
+        dailyHtml += '<tr style="border-bottom:1px solid var(--border)"><td style="padding:8px">' + dates[i] + '</td><td style="padding:8px;text-align:right;color:var(--ok)">₩' + dd.revenue.toLocaleString() + '</td><td style="padding:8px;text-align:right">' + dd.transactions + '</td><td style="padding:8px;text-align:right;color:var(--warn)">₩' + dayCostKRW.toLocaleString() + '</td><td style="padding:8px;text-align:right">' + dd.calls + '</td><td style="padding:8px;text-align:right;color:' + (dayProfit>=0?'var(--ok)':'var(--err)') + '">' + (dayProfit>=0?'+':'') + '₩' + dayProfit.toLocaleString() + '</td></tr>'
+      }
+    } else { dailyHtml += '<tr><td colspan="6" style="padding:12px;color:var(--muted);text-align:center">데이터 없음</td></tr>' }
+    dailyHtml += '</tbody></table>'
+    document.getElementById('dailyRevenueTable').innerHTML = dailyHtml
+  } catch(e) { console.error('Revenue load error:', e) }
+}
+
 // ═══ PASSWORD CHANGE ═══
 async function changePassword() {
   var cur = document.getElementById('currentPw').value
@@ -3538,9 +4013,13 @@ function showPanel(id, btn) {
   var panel = document.getElementById('panel-'+id)
   if (panel) panel.classList.add('active')
   if (btn) btn.classList.add('active')
-  var titles = {dashboard:'통계 요약',step1:'기본 정보',step2:'오프닝 설정',step3:'캐릭터 프롬프트',step4:'상황 이미지',step5:'캐릭터 상세',step6:'세계관 & 스펙',step7:'동영상 관리',apikeys:'API 키 관리',social:'소셜 로그인',payment:'결제 설정',password:'비밀번호 변경',danger:'위험 구역'}
+  var titles = {dashboard:'통계 요약',step1:'기본 정보',step2:'오프닝 설정',step3:'캐릭터 프롬프트',step4:'상황 이미지',step5:'캐릭터 상세',step6:'세계관 & 스펙',step7:'동영상 관리',members:'회원 관리',payhistory:'결제 내역',revenue:'수익 현황',apikeys:'API 키 관리',social:'소셜 로그인',payment:'결제 설정',password:'비밀번호 변경',danger:'위험 구역'}
   document.getElementById('mobileTitle').textContent = titles[id] || ''
   closeSidebar()
+  // Lazy-load data for specific panels
+  if (id === 'members') loadMembers()
+  if (id === 'payhistory') loadPayHistory()
+  if (id === 'revenue') loadRevenue()
 }
 
 // ═══ PAYMENT SETTINGS ═══
