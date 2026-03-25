@@ -266,7 +266,7 @@
 ### 4-1. 코드 받기
 
 ```bash
-git clone https://github.com/{REPO_OWNER}/{REPO_NAME}.git my-character-chat
+git clone https://github.com/ssap-pa/free-_-character-chat.git my-character-chat
 cd my-character-chat
 npm install
 ```
