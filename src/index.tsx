@@ -2422,7 +2422,7 @@ function renderLanding() {
       let mediaHTML = ''
       if (url.includes('tiktok.com')) {
         // TikTok embed
-        const tiktokId = url.match(/video\/(\d+)/)
+        const tiktokId = url.match(new RegExp('video/(\\d+)'))
         if (tiktokId) {
           mediaHTML = '<iframe src="https://www.tiktok.com/embed/v2/' + tiktokId[1] + '" style="width:100%;aspect-ratio:9/16;border:none;background:#000;border-radius:14px 14px 0 0" allowfullscreen></iframe>'
         } else {
@@ -2431,7 +2431,7 @@ function renderLanding() {
       } else if (url.includes('youtube.com') || url.includes('youtu.be')) {
         // YouTube embed
         let ytId = ''
-        const ytMatch = url.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/)
+        const ytMatch = url.match(new RegExp('(?:v=|youtu\\.be/)([a-zA-Z0-9_-]{11})'))
         if (ytMatch) ytId = ytMatch[1]
         if (ytId) {
           mediaHTML = '<iframe src="https://www.youtube.com/embed/' + ytId + '?autoplay=0&rel=0" style="width:100%;aspect-ratio:16/9;border:none;background:#000;border-radius:14px 14px 0 0" allowfullscreen></iframe>'
