@@ -1355,58 +1355,77 @@ app.get('/api/admin/social', adminAuth, async (c) => {
 
 // POST /api/admin/upload - Upload file (image or video) to KV
 app.post('/api/admin/upload', adminAuth, async (c) => {
-  const formData = await c.req.formData()
-  const file = formData.get('file') as File | null
-  if (!file) return c.json({ error: 'No file provided' }, 400)
+  try {
+    const formData = await c.req.formData()
+    const file = formData.get('file') as File | null
+    if (!file) return c.json({ error: 'No file provided' }, 400)
 
-  const maxSize = 25 * 1024 * 1024 // 25MB limit for KV
-  if (file.size > maxSize) return c.json({ error: '파일 크기가 25MB를 초과합니다.' }, 400)
+    const isVideo = file.type.startsWith('video/')
+    const maxSize = isVideo ? 25 * 1024 * 1024 : 25 * 1024 * 1024 // 25MB for KV
+    if (file.size > maxSize) {
+      const sizeMB = Math.round(file.size / 1024 / 1024)
+      return c.json({ error: `파일 크기(${sizeMB}MB)가 25MB를 초과합니다. 더 작은 파일을 사용하거나 외부 URL을 입력하세요.` }, 400)
+    }
 
-  const buffer = await file.arrayBuffer()
-  const bytes = new Uint8Array(buffer)
-  // Convert to base64
-  let binary = ''
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i])
+    const buffer = await file.arrayBuffer()
+    const fileId = 'file_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8)
+    const mimeType = file.type || 'application/octet-stream'
+    const fileName = file.name || 'upload'
+
+    // Store as raw ArrayBuffer in KV (no base64 encoding = 33% less size + faster)
+    await c.env.KV.put(fileId, buffer, {
+      metadata: { mimeType, fileName, size: file.size, uploadedAt: Date.now(), encoding: 'raw' }
+    })
+
+    return c.json({
+      success: true,
+      fileId,
+      url: '/api/files/' + fileId,
+      mimeType,
+      fileName,
+      size: file.size
+    })
+  } catch (e: any) {
+    const msg = e?.message || ''
+    if (msg.includes('Too large') || msg.includes('exceeds') || msg.includes('limit')) {
+      return c.json({ error: '파일이 너무 큽니다. 25MB 이하의 파일만 업로드 가능합니다. 동영상은 외부 URL(YouTube 등)을 사용해 주세요.' }, 413)
+    }
+    if (msg.includes('CPU') || msg.includes('time limit') || msg.includes('timeout')) {
+      return c.json({ error: '파일 처리 시간이 초과되었습니다. 더 작은 파일을 사용하거나 외부 URL을 입력해 주세요.' }, 408)
+    }
+    return c.json({ error: `업로드 실패: ${msg || '알 수 없는 오류'}` }, 500)
   }
-  const base64 = btoa(binary)
-
-  const fileId = 'file_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8)
-  const mimeType = file.type || 'application/octet-stream'
-  const fileName = file.name || 'upload'
-
-  // Store in KV with metadata
-  await c.env.KV.put(fileId, base64, {
-    metadata: { mimeType, fileName, size: file.size, uploadedAt: Date.now() }
-  })
-
-  return c.json({
-    success: true,
-    fileId,
-    url: '/api/files/' + fileId,
-    mimeType,
-    fileName,
-    size: file.size
-  })
 })
 
 // GET /api/files/:id - Serve uploaded file from KV
 app.get('/api/files/:id', async (c) => {
   const fileId = c.req.param('id')
-  const { value, metadata } = await c.env.KV.getWithMetadata(fileId)
-  if (!value) return c.json({ error: 'File not found' }, 404)
-
-  const meta = metadata as any || {}
-  const mimeType = meta.mimeType || 'application/octet-stream'
-
-  // Decode base64 to binary
-  const binaryStr = atob(value)
-  const bytes = new Uint8Array(binaryStr.length)
-  for (let i = 0; i < binaryStr.length; i++) {
-    bytes[i] = binaryStr.charCodeAt(i)
+  const meta = await c.env.KV.getWithMetadata(fileId, { type: 'arrayBuffer' })
+  if (!meta.value) {
+    // Fallback: try as text (for old base64-encoded files)
+    const textMeta = await c.env.KV.getWithMetadata(fileId, { type: 'text' })
+    if (!textMeta.value) return c.json({ error: 'File not found' }, 404)
+    const m = textMeta.metadata as any || {}
+    const mimeType = m.mimeType || 'application/octet-stream'
+    // Old base64 format - decode it
+    const binaryStr = atob(textMeta.value as string)
+    const bytes = new Uint8Array(binaryStr.length)
+    for (let i = 0; i < binaryStr.length; i++) {
+      bytes[i] = binaryStr.charCodeAt(i)
+    }
+    return new Response(bytes, {
+      headers: {
+        'Content-Type': mimeType,
+        'Cache-Control': 'public, max-age=31536000',
+        'Content-Disposition': 'inline'
+      }
+    })
   }
 
-  return new Response(bytes, {
+  const metadata = meta.metadata as any || {}
+  const mimeType = metadata.mimeType || 'application/octet-stream'
+
+  return new Response(meta.value as ArrayBuffer, {
     headers: {
       'Content-Type': mimeType,
       'Cache-Control': 'public, max-age=31536000',
@@ -4143,6 +4162,12 @@ async function uploadFile(file, progressBarId, progressWrapId) {
   formData.append('file', file)
 
   try {
+    var sizeMB = (file.size / 1024 / 1024).toFixed(1)
+    if (file.size > 25 * 1024 * 1024) {
+      toast('❌ 파일(' + sizeMB + 'MB)이 25MB를 초과합니다. 외부 URL을 사용해 주세요.')
+      progressWrap.style.display = 'none'
+      return null
+    }
     progressBar.style.width = '60%'
     var r = await fetch('/api/admin/upload', {
       method: 'POST',
@@ -4151,12 +4176,15 @@ async function uploadFile(file, progressBarId, progressWrapId) {
     })
     progressBar.style.width = '90%'
     var d = await r.json()
-    if (!r.ok) { toast('❌ ' + (d.error || '업로드 실패')); return null }
+    if (!r.ok) { toast('❌ ' + (d.error || '업로드 실패')); progressWrap.style.display = 'none'; progressBar.style.width = '0'; return null }
     progressBar.style.width = '100%'
     setTimeout(function() { progressWrap.style.display = 'none'; progressBar.style.width = '0' }, 500)
     return d
   } catch(e) {
-    toast('❌ 업로드 중 오류 발생')
+    var errMsg = '업로드 중 오류 발생'
+    if (e && e.message) errMsg += ': ' + e.message
+    if (file.size > 10 * 1024 * 1024) errMsg += ' (대용량 파일은 외부 URL 사용을 권장합니다)'
+    toast('❌ ' + errMsg)
     progressWrap.style.display = 'none'
     progressBar.style.width = '0'
     return null
