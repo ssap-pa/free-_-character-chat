@@ -1508,6 +1508,161 @@ app.get('/admin/', async (c) => {
   return c.html(adminHTML)
 })
 
+// ═══ DEMO ADMIN PAGE (read-only snapshot) ═══
+app.get('/demo', async (c) => c.redirect('/demo/'))
+app.get('/demo/', async (c) => {
+  // Inject demo mode script before </head> and override login behavior
+  const demoScript = `
+<script>window.__DEMO_MODE__ = true;</script>
+<style>
+  #loginSection{display:none!important}
+  #mainSection{display:block!important}
+  .demo-badge{position:fixed;top:12px;right:12px;z-index:9999;background:linear-gradient(135deg,#7c5cbf,#e05050);color:#fff;padding:6px 16px;border-radius:20px;font-size:12px;font-weight:700;letter-spacing:.5px;box-shadow:0 2px 12px rgba(124,92,191,.4);pointer-events:none}
+  .demo-lock::after{content:" 🔒";font-size:10px}
+</style>`
+  const demoBadge = '<div class="demo-badge">DEMO MODE — 읽기 전용</div>'
+  
+  // Override the script section to work in demo mode
+  const demoOverride = `
+<script>
+// ─── DEMO MODE OVERRIDE ───
+// This runs BEFORE the main admin script
+window.__DEMO_MODE__ = true;
+
+// Intercept all fetch calls to block writes
+var _origFetch = window.fetch;
+window.fetch = function(url, opts) {
+  opts = opts || {};
+  var method = (opts.method || 'GET').toUpperCase();
+  // Allow only GET requests and /api/admin/login for demo data loading
+  if (method !== 'GET' && url !== '/api/admin/login') {
+    // Block all POST/PUT/DELETE in demo mode
+    return Promise.resolve(new Response(JSON.stringify({error:'데모 모드에서는 수정할 수 없습니다.'}), {status:403, headers:{'Content-Type':'application/json'}}));
+  }
+  return _origFetch.apply(this, arguments);
+};
+</script>`
+
+  let demoHTML = adminHTML
+    .replace('<title>관리자 패널</title>', '<title>관리자 패널 — DEMO</title>')
+    .replace('</head>', demoScript + '</head>')
+    .replace('<div class="toast"', demoBadge + '<div class="toast"')
+  
+  // Replace the main <script> opening to add demo auto-login
+  demoHTML = demoHTML.replace(
+    '<script>\nvar adminToken = sessionStorage.getItem(\'adminToken\')\nvar charData = {}\n\nif (adminToken) { showMain() }',
+    demoOverride + `
+<script>
+var adminToken = '__DEMO__'
+var charData = {}
+
+// Auto-show main in demo mode
+setTimeout(function() {
+  document.getElementById('loginSection').style.display = 'none';
+  document.getElementById('mainSection').style.display = 'block';
+  // Load data using public API (no auth needed)
+  demoLoadAll();
+}, 100);
+
+async function demoLoadAll() {
+  try {
+    // Use public character API (no auth needed)
+    var r = await _origFetch('/api/character');
+    if (r.ok) {
+      charData = await r.json();
+      document.getElementById('charName').value = charData.name || '';
+      document.getElementById('charIntro').value = charData.intro || '';
+      document.getElementById('charImage').value = charData.profileImageUrl || '';
+      document.getElementById('charOpening').value = charData.openingMessage || '';
+      document.getElementById('charPlayGuide').value = charData.playGuide || '';
+      document.getElementById('charPrompt').value = charData.characterPrompt || '';
+      document.getElementById('charDetail').value = charData.characterDetail || '';
+      document.getElementById('charGenre').value = charData.genre || 'fantasy';
+      document.getElementById('charHashtags').value = (charData.hashtags || []).join(', ');
+      document.getElementById('charLore').value = charData.lore || '';
+      previewProfile();
+      renderSpecs(charData.specs || []);
+      renderSituationImages(charData.situationImages || []);
+      renderVideos(charData.videos || []);
+    }
+    // Status
+    var sr = await _origFetch('/api/status');
+    var sd = await sr.json();
+    var claudeIcon = sd.claude === 'configured' ? '<span style="color:var(--ok)">✅</span>' : '<span style="color:var(--muted)">⬜</span>';
+    var openaiIcon = sd.openai === 'configured' ? '<span style="color:var(--ok)">✅</span>' : '<span style="color:var(--muted)">⬜</span>';
+    document.getElementById('sysInfo').innerHTML =
+      '<b>Claude:</b> ' + claudeIcon + (sd.claude === 'configured' ? ' 연결됨' : ' 미설정') + '<br>' +
+      '<b>OpenAI:</b> ' + openaiIcon + (sd.openai === 'configured' ? ' 연결됨' : ' 미설정') + '<br>' +
+      '<b>캐릭터:</b> ' + (charData.name || '-') + '<br>' +
+      '<b>장르:</b> ' + (charData.genre || '-');
+    var cs = document.getElementById('claudeStatus');
+    var os = document.getElementById('openaiStatus');
+    if (cs) cs.innerHTML = sd.claude === 'configured' ? '<span style="color:var(--ok)">✅ 키 설정됨</span>' : '<span style="color:var(--warn)">⚠️ 미설정</span>';
+    if (os) os.innerHTML = sd.openai === 'configured' ? '<span style="color:var(--ok)">✅ 키 설정됨</span>' : '<span style="color:var(--warn)">⚠️ 미설정</span>';
+    // Demo stats (mock data)
+    document.getElementById('statMembers').textContent = '—';
+    document.getElementById('statGuests').textContent = '—';
+    document.getElementById('statSessions').textContent = '—';
+    if (document.getElementById('statTokens')) document.getElementById('statTokens').textContent = '—';
+    if (document.getElementById('statRevenue')) document.getElementById('statRevenue').textContent = '—';
+    if (document.getElementById('statApiCost')) document.getElementById('statApiCost').textContent = '—';
+    if (document.getElementById('statProfit')) document.getElementById('statProfit').textContent = '—';
+    if (document.getElementById('statApiCalls')) document.getElementById('statApiCalls').textContent = '—';
+    // API key fields - mask
+    var claudeEl = document.getElementById('claudeKey');
+    var openaiEl = document.getElementById('openaiKey');
+    if (claudeEl) { claudeEl.value = ''; claudeEl.placeholder = 'sk-ant-api03-••••••••••••••••'; claudeEl.readOnly = true; }
+    if (openaiEl) { openaiEl.value = ''; openaiEl.placeholder = 'sk-••••••••••••••••'; openaiEl.readOnly = true; }
+    // Toss keys - mask
+    var tossClient = document.getElementById('tossClientKey');
+    var tossSecret = document.getElementById('tossSecretKey');
+    if (tossClient) { tossClient.value = ''; tossClient.placeholder = 'test_ck_••••••••'; tossClient.readOnly = true; }
+    if (tossSecret) { tossSecret.value = ''; tossSecret.placeholder = 'test_sk_••••••••'; tossSecret.readOnly = true; }
+    // Password field - mask
+    var pwFields = document.querySelectorAll('input[type=password]');
+    pwFields.forEach(function(el) { el.readOnly = true; el.placeholder = '••••••••'; });
+  } catch(e) { console.log('Demo load error:', e); }
+}
+`
+  )
+  
+  // Override all save/delete/reset functions to show demo toast
+  demoHTML = demoHTML.replace('</script>\n</body>\n</html>', `
+
+// ─── Demo mode: override all write functions ───
+if (window.__DEMO_MODE__) {
+  var _demoMsg = function() { toast('🔒 데모 모드에서는 수정할 수 없습니다. 실제 관리자 페이지에서 수정하세요.'); };
+  // Override save functions
+  window.saveBasic = _demoMsg;
+  window.saveOpening = _demoMsg;
+  window.savePrompt = _demoMsg;
+  window.saveDetail = _demoMsg;
+  window.saveLore = _demoMsg;
+  window.saveKeys = _demoMsg;
+  window.savePaymentSettings = _demoMsg;
+  window.saveSocial = _demoMsg;
+  window.changePassword = _demoMsg;
+  window.resetSessions = _demoMsg;
+  window.addSituationImage = _demoMsg;
+  window.deleteSI = _demoMsg;
+  window.addVideo = _demoMsg;
+  window.deleteVideo = _demoMsg;
+  window.uploadFile = function() { _demoMsg(); return Promise.resolve(null); };
+  window.handleProfileFileSelect = _demoMsg;
+  window.handleSIFileSelect = _demoMsg;
+  window.handleVidFileSelect = _demoMsg;
+  window.handleVidThumbFileSelect = _demoMsg;
+  window.addSpecRow = _demoMsg;
+  // Override adminLogin
+  window.adminLogin = _demoMsg;
+}
+</script>
+</body>
+</html>`)
+
+  return c.html(demoHTML)
+})
+
 // ─── MAIN HTML (inline for Cloudflare Workers) ───
 // ─── Legal Page Templates ───
 function legalPageHTML(title: string, serviceName: string, content: string): string {
