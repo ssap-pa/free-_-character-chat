@@ -2262,7 +2262,34 @@ function renderLanding() {
       info += '<div class="video-card-title">' + (v.title || '동영상 클립') + '</div>'
       info += '<div class="video-card-desc">' + (v.description || '') + '</div>'
       info += '</div>'
-      return '<div class="video-slide"><div class="video-card"><video controls playsinline preload="metadata" loop' + poster + autoAttr + '><source src="' + v.videoUrl + '"></video>' + info + '</div></div>'
+      // Detect external platform URLs vs direct video files
+      const url = v.videoUrl || ''
+      let mediaHTML = ''
+      if (url.includes('tiktok.com')) {
+        // TikTok embed
+        const tiktokId = url.match(/video\/(\d+)/)
+        if (tiktokId) {
+          mediaHTML = '<iframe src="https://www.tiktok.com/embed/v2/' + tiktokId[1] + '" style="width:100%;aspect-ratio:9/16;border:none;background:#000;border-radius:14px 14px 0 0" allowfullscreen></iframe>'
+        } else {
+          mediaHTML = '<a href="' + url + '" target="_blank" rel="noopener" style="display:flex;align-items:center;justify-content:center;width:100%;aspect-ratio:9/16;background:#000;border-radius:14px 14px 0 0;color:#fff;text-decoration:none;font-size:14px"><i class="fab fa-tiktok" style="font-size:32px;margin-right:8px"></i>TikTok에서 보기</a>'
+        }
+      } else if (url.includes('youtube.com') || url.includes('youtu.be')) {
+        // YouTube embed
+        let ytId = ''
+        const ytMatch = url.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/)
+        if (ytMatch) ytId = ytMatch[1]
+        if (ytId) {
+          mediaHTML = '<iframe src="https://www.youtube.com/embed/' + ytId + '?autoplay=0&rel=0" style="width:100%;aspect-ratio:16/9;border:none;background:#000;border-radius:14px 14px 0 0" allowfullscreen></iframe>'
+        } else {
+          mediaHTML = '<a href="' + url + '" target="_blank" rel="noopener" style="display:flex;align-items:center;justify-content:center;width:100%;aspect-ratio:16/9;background:#000;border-radius:14px 14px 0 0;color:#fff;text-decoration:none;font-size:14px"><i class="fab fa-youtube" style="font-size:32px;margin-right:8px;color:#f00"></i>YouTube에서 보기</a>'
+        }
+      } else if (url.includes('instagram.com')) {
+        mediaHTML = '<a href="' + url + '" target="_blank" rel="noopener" style="display:flex;align-items:center;justify-content:center;width:100%;aspect-ratio:9/16;background:#000;border-radius:14px 14px 0 0;color:#fff;text-decoration:none;font-size:14px"><i class="fab fa-instagram" style="font-size:32px;margin-right:8px;color:#e1306c"></i>Instagram에서 보기</a>'
+      } else {
+        // Direct video file (mp4, webm, etc) or internal /api/files/ URL
+        mediaHTML = '<video controls playsinline preload="metadata" loop' + poster + autoAttr + '><source src="' + url + '"></video>'
+      }
+      return '<div class="video-slide"><div class="video-card">' + mediaHTML + info + '</div></div>'
     }).join('')
     trackHTML += '</div>'
     if (count > 1) {
