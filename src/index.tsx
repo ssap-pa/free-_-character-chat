@@ -1400,38 +1400,46 @@ app.post('/api/admin/upload', adminAuth, async (c) => {
 // GET /api/files/:id - Serve uploaded file from KV
 app.get('/api/files/:id', async (c) => {
   const fileId = c.req.param('id')
-  const meta = await c.env.KV.getWithMetadata(fileId, { type: 'arrayBuffer' })
-  if (!meta.value) {
-    // Fallback: try as text (for old base64-encoded files)
-    const textMeta = await c.env.KV.getWithMetadata(fileId, { type: 'text' })
-    if (!textMeta.value) return c.json({ error: 'File not found' }, 404)
-    const m = textMeta.metadata as any || {}
-    const mimeType = m.mimeType || 'application/octet-stream'
-    // Old base64 format - decode it
-    const binaryStr = atob(textMeta.value as string)
-    const bytes = new Uint8Array(binaryStr.length)
-    for (let i = 0; i < binaryStr.length; i++) {
-      bytes[i] = binaryStr.charCodeAt(i)
-    }
-    return new Response(bytes, {
-      headers: {
-        'Content-Type': mimeType,
-        'Cache-Control': 'public, max-age=31536000',
-        'Content-Disposition': 'inline'
-      }
-    })
+
+  // First try to get metadata to check encoding
+  const metaOnly = await c.env.KV.getWithMetadata(fileId, { type: 'text' })
+  if (!metaOnly.value && metaOnly.value !== '') return c.json({ error: 'File not found' }, 404)
+
+  const metadata = metaOnly.metadata as any || {}
+  const mimeType = metadata.mimeType || 'application/octet-stream'
+  const encoding = metadata.encoding || ''
+  const headers = {
+    'Content-Type': mimeType,
+    'Cache-Control': 'public, max-age=31536000',
+    'Content-Disposition': 'inline',
+    'Access-Control-Allow-Origin': '*'
   }
 
-  const metadata = meta.metadata as any || {}
-  const mimeType = metadata.mimeType || 'application/octet-stream'
-
-  return new Response(meta.value as ArrayBuffer, {
-    headers: {
-      'Content-Type': mimeType,
-      'Cache-Control': 'public, max-age=31536000',
-      'Content-Disposition': 'inline'
+  // Detect base64: check encoding flag or data prefix
+  const textVal = metaOnly.value as string
+  let isBase64 = encoding === 'base64'
+  if (!isBase64 && textVal.length > 10) {
+    const head = textVal.substring(0, 8)
+    if (head.startsWith('/9j/') || head.startsWith('iVBOR') || head.startsWith('R0lGOD') || head.startsWith('UklGR')) {
+      isBase64 = true
     }
-  })
+  }
+
+  if (isBase64) {
+    // Decode base64 using atob (fast native implementation in Workers)
+    const binaryStr = atob(textVal)
+    const len = binaryStr.length
+    const decoded = new Uint8Array(len)
+    for (let i = 0; i < len; i++) {
+      decoded[i] = binaryStr.charCodeAt(i)
+    }
+    return new Response(decoded, { headers })
+  }
+
+  // Not base64 - retrieve as raw arrayBuffer
+  const raw = await c.env.KV.get(fileId, { type: 'arrayBuffer' })
+  if (!raw) return c.json({ error: 'File not found' }, 404)
+  return new Response(raw, { headers })
 })
 
 // ═══  VIDEO MANAGEMENT API  ═══
