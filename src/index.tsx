@@ -415,6 +415,14 @@ function parseResponse(raw: string): { sets: Array<{ narrative: string; dialogue
       const dialogueMatch = trimmed.match(/[""\u201C]([^""\u201D]+)[""\u201D]/)
       if (narrativeMatch) currentNarrative += (currentNarrative ? ' ' : '') + narrativeMatch[1]
       if (dialogueMatch) currentDialogue += (currentDialogue ? '\n' : '') + dialogueMatch[1]
+      if (!narrativeMatch && !dialogueMatch) {
+        if (currentDialogue && currentNarrative) {
+          sets.push({ narrative: currentNarrative, dialogue: currentDialogue })
+          currentNarrative = ''
+          currentDialogue = ''
+        }
+        currentNarrative += (currentNarrative ? ' ' : '') + trimmed
+      }
     }
   }
   
@@ -2894,7 +2902,11 @@ function parseMsgSets(raw) {
       if (narMatch) { for (var j = 0; j < narMatch.length; j++) curNarr += (curNarr ? ' ' : '') + narMatch[j].replace(/[*]/g, '') }
       if (dialMatch) { for (var k = 0; k < dialMatch.length; k++) curDial += (curDial ? String.fromCharCode(10) : '') + stripQuotes(dialMatch[k]) }
       if (!narMatch && !dialMatch) {
-        curDial += (curDial ? ' ' : '') + t
+        if (curDial && curNarr) {
+          sets.push({ narrative: curNarr, dialogue: curDial })
+          curNarr = ''; curDial = ''
+        }
+        curNarr += (curNarr ? ' ' : '') + t
       }
     }
   }
